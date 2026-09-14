@@ -1,0 +1,30 @@
+# ROS / colcon outputs
+build/
+install/
+log/
+.openarm_v1_overlay/
+.openarm_v1_real_overlay_v4/
+.openarm_v1_real_overlay_v4.backup*/
+
+# Python and editor state
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+.vscode/
+
+# Local runtime artifacts
+.cache/
+runtime_logs/
+*.terminal.log
+out/
+verification/
+
+# Local credentials and generated upstream checkout metadata
+.env
+.env.*
+!.env.example
+**/.git/

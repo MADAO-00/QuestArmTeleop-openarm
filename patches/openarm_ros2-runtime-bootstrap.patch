@@ -1,0 +1,109 @@
+diff --git a/openarm_hardware/include/openarm_hardware/openarm_simple_hardware.hpp b/openarm_hardware/include/openarm_hardware/openarm_simple_hardware.hpp
+--- a/openarm_hardware/include/openarm_hardware/openarm_simple_hardware.hpp
++++ b/openarm_hardware/include/openarm_hardware/openarm_simple_hardware.hpp
+@@ -144,7 +144,8 @@ class OpenArmHW : public hardware_interface::SystemInterface {
+   std::array<std::chrono::steady_clock::time_point, ARM_DOF>
+       runtime_feedback_times_{};
+   uint64_t runtime_gripper_feedback_count_ = 0;
+   std::chrono::steady_clock::time_point runtime_gripper_feedback_time_{};
+   bool runtime_feedback_watchdog_seeded_ = false;
++  bool runtime_feedback_bootstrap_pending_ = false;
+ 
+   static constexpr std::array<double, ARM_DOF> ZERO_POSITION = {
+@@ -166,6 +167,7 @@ class OpenArmHW : public hardware_interface::SystemInterface {
+       const std::function<void()>& send_once,
+       bool send_disable_if_busy = false);
+   bool seed_runtime_feedback_watchdog();
++  bool bootstrap_runtime_feedback();
+   bool collect_runtime_feedback();
+   bool seed_commands_from_feedback();
+   bool best_effort_disable() noexcept;
+diff --git a/openarm_hardware/src/openarm_simple_hardware.cpp b/openarm_hardware/src/openarm_simple_hardware.cpp
+--- a/openarm_hardware/src/openarm_simple_hardware.cpp
++++ b/openarm_hardware/src/openarm_simple_hardware.cpp
+@@ -477,12 +477,34 @@ bool OpenArmHW::seed_runtime_feedback_watchdog() {
+   if (hand_) {
+     runtime_gripper_feedback_count_ =
+         gripper_motors.front().state_update_count();
+     runtime_gripper_feedback_time_ = now;
+   }
+   runtime_feedback_watchdog_seeded_ = true;
+   return true;
+ }
+ 
++bool OpenArmHW::bootstrap_runtime_feedback() {
++  // ros2_control activates multiple hardware components serially, then starts
++  // its read-update-write loop. Re-establish a causal, non-motion feedback
++  // boundary on the first read so another arm's activation latency cannot age
++  // this arm's activation sample past the strict runtime watchdog deadline.
++  if (!run_feedback_transaction(
++          1, "runtime feedback bootstrap", ACTIVATION_FEEDBACK_TIMEOUT,
++          [this]() { openarm_->refresh_all(); })) {
++    return false;
++  }
++  if (!seed_commands_from_feedback()) {
++    return false;
++  }
++  if (!seed_runtime_feedback_watchdog()) {
++    return false;
++  }
++  runtime_feedback_bootstrap_pending_ = false;
++  RCLCPP_INFO(rclcpp::get_logger("OpenArmHW"),
++              "Fresh runtime feedback bootstrap passed");
++  return true;
++}
++
+ bool OpenArmHW::collect_runtime_feedback() {
+   if (!runtime_feedback_watchdog_seeded_) {
+     RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
+@@ -679,7 +701,8 @@ bool OpenArmHW::seed_commands_from_feedback() {
+ }
+ 
+ bool OpenArmHW::best_effort_disable() noexcept {
+   runtime_feedback_watchdog_seeded_ = false;
++  runtime_feedback_bootstrap_pending_ = false;
+   for (int attempt = 1; attempt <= BEST_EFFORT_DISABLE_ATTEMPTS; ++attempt) {
+     try {
+       openarm_->set_callback_mode_all(
+@@ -720,7 +743,8 @@ hardware_interface::CallbackReturn OpenArmHW::on_activate(
+     RCLCPP_INFO(rclcpp::get_logger("OpenArmHW"),
+                 "Activating OpenArm V10 in current-position hold mode...");
+     openarm_->set_callback_mode_all(openarm::damiao_motor::CallbackMode::STATE);
+     runtime_feedback_watchdog_seeded_ = false;
++    runtime_feedback_bootstrap_pending_ = false;
+ 
+     // Disable is the only activation command that may be retried. Every retry
+     // is an independent causal transaction with a new quiet drain and counter
+@@ -802,6 +826,5 @@ hardware_interface::CallbackReturn OpenArmHW::on_activate(
+-    if (!seed_runtime_feedback_watchdog()) {
+-      return fail_activation("runtime feedback watchdog could not be seeded");
+-    }
++    runtime_feedback_watchdog_seeded_ = false;
++    runtime_feedback_bootstrap_pending_ = true;
+ 
+     RCLCPP_INFO(rclcpp::get_logger("OpenArmHW"),
+                 "OpenArm V10 activated at the measured current position");
+@@ -825,6 +848,7 @@ hardware_interface::CallbackReturn OpenArmHW::on_deactivate(
+     const rclcpp_lifecycle::State& /*previous_state*/) {
+   RCLCPP_INFO(rclcpp::get_logger("OpenArmHW"), "Deactivating OpenArm V10...");
+   runtime_feedback_watchdog_seeded_ = false;
++  runtime_feedback_bootstrap_pending_ = false;
+ 
+   if (!best_effort_disable()) {
+     RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
+@@ -840,9 +864,13 @@ hardware_interface::return_type OpenArmHW::read(
+ hardware_interface::return_type OpenArmHW::read(
+     const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/) {
+   try {
+-    if (!collect_runtime_feedback()) {
++    const bool feedback_valid = runtime_feedback_bootstrap_pending_
++                                    ? bootstrap_runtime_feedback()
++                                    : collect_runtime_feedback();
++    if (!feedback_valid) {
+       RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
+-                   "Enabled runtime feedback is invalid or stale; disabling "
++                   "Enabled runtime feedback bootstrap/validation failed; "
++                   "disabling "
+                    "hardware instead of publishing unsafe state");
+       best_effort_disable();
+       rclcpp::shutdown();

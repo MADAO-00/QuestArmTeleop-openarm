@@ -1,0 +1,3 @@
+# Offline tests also need NumPy/SciPy/PyYAML from requirements.txt.
+-r requirements.txt
+pytest>=8.1,<9

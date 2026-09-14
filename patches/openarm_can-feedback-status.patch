@@ -1,0 +1,118 @@
+diff --git a/include/openarm/damiao_motor/dm_motor.hpp b/include/openarm/damiao_motor/dm_motor.hpp
+index fa47753..bff0c94 100644
+--- a/include/openarm/damiao_motor/dm_motor.hpp
++++ b/include/openarm/damiao_motor/dm_motor.hpp
+@@ -44,6 +44,7 @@ public:
+ 
+     // Enable status getters
+     bool is_enabled() const { return enabled_; }
++    uint64_t state_update_count() const { return state_update_count_; }
+ 
+     // Parameter methods
+     double get_param(int RID) const;
+@@ -66,6 +67,7 @@ protected:
+ 
+     // Enable status
+     bool enabled_;
++    uint64_t state_update_count_;
+ 
+     // Current state
+     double state_q_, state_dq_, state_tau_;
+diff --git a/include/openarm/damiao_motor/dm_motor_control.hpp b/include/openarm/damiao_motor/dm_motor_control.hpp
+index 4b6ad79..881b5b9 100644
+--- a/include/openarm/damiao_motor/dm_motor_control.hpp
++++ b/include/openarm/damiao_motor/dm_motor_control.hpp
+@@ -40,6 +40,7 @@ struct StateResult {
+     double torque;
+     int t_mos;
+     int t_rotor;
++    int status;
+     bool valid;
+ };
+ 
+diff --git a/python/src/openarm_can.cpp b/python/src/openarm_can.cpp
+index 6520aaa..82c10ad 100644
+--- a/python/src/openarm_can.cpp
++++ b/python/src/openarm_can.cpp
+@@ -154,6 +154,7 @@ NB_MODULE(_openarm_can, m) {
+         .def_rw("torque", &StateResult::torque)
+         .def_rw("t_mos", &StateResult::t_mos)
+         .def_rw("t_rotor", &StateResult::t_rotor)
++        .def_rw("status", &StateResult::status)
+         .def_rw("valid", &StateResult::valid);
+ 
+     // CANPacket struct
+@@ -227,6 +228,7 @@ NB_MODULE(_openarm_can, m) {
+         .def("get_recv_can_id", &Motor::get_recv_can_id)
+         .def("get_motor_type", &Motor::get_motor_type)
+         .def("is_enabled", &Motor::is_enabled)
++        .def("state_update_count", &Motor::state_update_count)
+         .def("get_param", &Motor::get_param, nb::arg("rid"))
+         .def_static("get_limit_param", &Motor::get_limit_param, nb::arg("motor_type"));
+ 
+diff --git a/src/openarm/damiao_motor/dm_motor.cpp b/src/openarm/damiao_motor/dm_motor.cpp
+index 5f28152..876646a 100644
+--- a/src/openarm/damiao_motor/dm_motor.cpp
++++ b/src/openarm/damiao_motor/dm_motor.cpp
+@@ -25,6 +25,7 @@ Motor::Motor(MotorType motor_type, uint32_t send_can_id, uint32_t recv_can_id)
+       recv_can_id_(recv_can_id),
+       motor_type_(motor_type),
+       enabled_(false),
++      state_update_count_(0),
+       state_q_(0.0),
+       state_dq_(0.0),
+       state_tau_(0.0),
+@@ -51,6 +52,7 @@ void Motor::update_state(double q, double dq, double tau, int tmos, int trotor) {
+     state_tau_ = tau;
+     state_tmos_ = tmos;
+     state_trotor_ = trotor;
++    ++state_update_count_;
+ }
+ 
+ void Motor::set_state_tmos(int tmos) { state_tmos_ = tmos; }
+diff --git a/src/openarm/damiao_motor/dm_motor_control.cpp b/src/openarm/damiao_motor/dm_motor_control.cpp
+index 0e6a8c6..3a83d0c 100644
+--- a/src/openarm/damiao_motor/dm_motor_control.cpp
++++ b/src/openarm/damiao_motor/dm_motor_control.cpp
+@@ -90,10 +90,11 @@ StateResult CanPacketDecoder::parse_motor_state_data(const Motor& motor,
+                                                      const std::vector<uint8_t>& data) {
+     if (data.size() < 8) {
+         std::cerr << "Warning: Skipping motor state data less than 8 bytes" << std::endl;
+-        return {0, 0, 0, 0, 0, false};
++        return {0, 0, 0, 0, 0, 0, false};
+     }
+ 
+     // Parse state data
++    int status = static_cast<int>(data[0] >> 4);
+     uint16_t q_uint = (static_cast<uint16_t>(data[1]) << 8) | data[2];
+     uint16_t dq_uint =
+         (static_cast<uint16_t>(data[3]) << 4) | (static_cast<uint16_t>(data[4]) >> 4);
+@@ -107,7 +108,7 @@ StateResult CanPacketDecoder::parse_motor_state_data(const Motor& motor,
+     double recv_dq = CanPacketDecoder::uint_to_double(dq_uint, -limits.vMax, limits.vMax, 12);
+     double recv_tau = CanPacketDecoder::uint_to_double(tau_uint, -limits.tMax, limits.tMax, 12);
+ 
+-    return {recv_q, recv_dq, recv_tau, t_mos, t_rotor, true};
++    return {recv_q, recv_dq, recv_tau, t_mos, t_rotor, status, true};
+ }
+ 
+ ParamResult CanPacketDecoder::parse_motor_param_data(const std::vector<uint8_t>& data) {
+diff --git a/src/openarm/damiao_motor/dm_motor_device.cpp b/src/openarm/damiao_motor/dm_motor_device.cpp
+index 6e1dd90..8ca803d 100644
+--- a/src/openarm/damiao_motor/dm_motor_device.cpp
++++ b/src/openarm/damiao_motor/dm_motor_device.cpp
+@@ -48,6 +48,7 @@ void DMCANDevice::callback(const can_frame& frame) {
+                 // Convert frame data to vector and let Motor handle parsing
+                 StateResult result = CanPacketDecoder::parse_motor_state_data(motor_, data);
+                 if (frame.can_id == motor_.get_recv_can_id() && result.valid) {
++                    motor_.set_enabled(result.status == 1);
+                     motor_.update_state(result.position, result.velocity, result.torque,
+                                         result.t_mos, result.t_rotor);
+                 }
+@@ -82,6 +83,7 @@ void DMCANDevice::callback(const canfd_frame& frame) {
+     if (callback_mode_ == STATE) {
+         StateResult result = CanPacketDecoder::parse_motor_state_data(motor_, data);
+         if (result.valid) {
++            motor_.set_enabled(result.status == 1);
+             motor_.update_state(result.position, result.velocity, result.torque, result.t_mos,
+                                 result.t_rotor);
+         }

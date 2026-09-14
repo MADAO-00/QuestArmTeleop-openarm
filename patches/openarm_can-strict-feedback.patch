@@ -1,0 +1,326 @@
+diff --git a/include/openarm/damiao_motor/dm_motor.hpp b/include/openarm/damiao_motor/dm_motor.hpp
+index f6aa9fc95d13d9427839a343bdf574250b8abc92..a02c133941b785e51ad58aa5d3857e75de813d80 100644
+--- a/include/openarm/damiao_motor/dm_motor.hpp
++++ b/include/openarm/damiao_motor/dm_motor.hpp
+@@ -42,8 +42,9 @@ public:
+     uint32_t get_recv_can_id() const { return recv_can_id_; }
+     MotorType get_motor_type() const { return motor_type_; }
+ 
+-    // Enable status getters
+-    bool is_enabled() const { return enabled_; }
++    // Exact status getters
++    int get_status() const { return status_; }
++    bool is_enabled() const { return status_ == 1; }
+     uint64_t state_update_count() const { return state_update_count_; }
+ 
+     // Parameter methods
+@@ -57,7 +58,7 @@ protected:
+     void update_state(double q, double dq, double tau, int tmos, int trotor);
+     void set_state_tmos(int tmos);
+     void set_state_trotor(int trotor);
+-    void set_enabled(bool enabled);
++    void set_status(int status);
+     void set_temp_param(int RID, double val);
+ 
+     // Motor identifiers
+@@ -65,8 +66,9 @@ protected:
+     uint32_t recv_can_id_;
+     MotorType motor_type_;
+ 
+-    // Enable status
+-    bool enabled_;
++    // Exact raw status reported in the high nibble of a state response.
++    // -1 means that no valid state response has been received yet.
++    int status_;
+     uint64_t state_update_count_;
+ 
+     // Current state
+diff --git a/include/openarm/damiao_motor/dm_motor_device_collection.hpp b/include/openarm/damiao_motor/dm_motor_device_collection.hpp
+index 78d6697252cbb40fe439c6e150037a8179dd7014..702a0f66c75edcbd6535c5111037b01a25537bbc 100644
+--- a/include/openarm/damiao_motor/dm_motor_device_collection.hpp
++++ b/include/openarm/damiao_motor/dm_motor_device_collection.hpp
+@@ -78,7 +78,7 @@ protected:
+     std::unique_ptr<canbus::CANDeviceCollection> device_collection_;
+ 
+     // Helper methods for subclasses
+-    void send_command_to_device(std::shared_ptr<DMCANDevice> dm_device, const CANPacket& packet);
++    bool send_command_to_device(std::shared_ptr<DMCANDevice> dm_device, const CANPacket& packet);
+     std::vector<std::shared_ptr<DMCANDevice>> get_dm_devices() const;
+ };
+ }  // namespace openarm::damiao_motor
+diff --git a/python/src/openarm_can.cpp b/python/src/openarm_can.cpp
+index 028a8565516c1a813768df16e411a874a0f4d844..493d3ba9a2d54df2a5da05f181490479e6bdf1e0 100644
+--- a/python/src/openarm_can.cpp
++++ b/python/src/openarm_can.cpp
+@@ -227,6 +227,7 @@ NB_MODULE(openarm_can, m) {
+         .def("get_send_can_id", &Motor::get_send_can_id)
+         .def("get_recv_can_id", &Motor::get_recv_can_id)
+         .def("get_motor_type", &Motor::get_motor_type)
++        .def("get_status", &Motor::get_status)
+         .def("is_enabled", &Motor::is_enabled)
+         .def("state_update_count", &Motor::state_update_count)
+         .def("get_param", &Motor::get_param, nb::arg("rid"))
+diff --git a/src/openarm/can/socket/openarm.cpp b/src/openarm/can/socket/openarm.cpp
+index 3083f091fc01909b23c8bd85406e19742f2ffbe3..cb063ef350f4ef601448b36b95ca52722fd96212 100644
+--- a/src/openarm/can/socket/openarm.cpp
++++ b/src/openarm/can/socket/openarm.cpp
+@@ -15,12 +15,30 @@
+ #include <linux/can.h>
+ #include <linux/can/raw.h>
+ 
++#include <exception>
+ #include <openarm/can/socket/openarm.hpp>
+ 
+ #include "openarm/damiao_motor/dm_motor_constants.hpp"
+ 
+ namespace openarm::can::socket {
+ 
++namespace {
++template <typename Operation>
++void apply_to_all_collections(
++    const std::vector<damiao_motor::DMDeviceCollection*>& device_collections,
++    Operation operation) {
++    std::exception_ptr first_error;
++    for (damiao_motor::DMDeviceCollection* device_collection : device_collections) {
++        try {
++            operation(*device_collection);
++        } catch (...) {
++            if (!first_error) first_error = std::current_exception();
++        }
++    }
++    if (first_error) std::rethrow_exception(first_error);
++}
++}  // namespace
++
+ OpenArm::OpenArm(const std::string& can_interface, bool enable_fd)
+     : can_interface_(can_interface), enable_fd_(enable_fd) {
+     can_socket_ = std::make_unique<canbus::CANSocket>(can_interface_, enable_fd_);
+@@ -58,9 +76,10 @@ void OpenArm::register_dm_device_collection(damiao_motor::DMDeviceCollection& de
+ }
+ 
+ void OpenArm::enable_all() {
+-    for (damiao_motor::DMDeviceCollection* device_collection : sub_dm_device_collections_) {
+-        device_collection->enable_all();
+-    }
++    apply_to_all_collections(sub_dm_device_collections_,
++                             [](damiao_motor::DMDeviceCollection& device_collection) {
++                                 device_collection.enable_all();
++                             });
+ }
+ 
+ void OpenArm::set_zero_all() {
+@@ -70,9 +89,10 @@ void OpenArm::set_zero_all() {
+ }
+ 
+ void OpenArm::refresh_all() {
+-    for (damiao_motor::DMDeviceCollection* device_collection : sub_dm_device_collections_) {
+-        device_collection->refresh_all();
+-    }
++    apply_to_all_collections(sub_dm_device_collections_,
++                             [](damiao_motor::DMDeviceCollection& device_collection) {
++                                 device_collection.refresh_all();
++                             });
+ }
+ 
+ void OpenArm::refresh_one(int i) {
+@@ -82,9 +102,10 @@ void OpenArm::refresh_one(int i) {
+ }
+ 
+ void OpenArm::disable_all() {
+-    for (damiao_motor::DMDeviceCollection* device_collection : sub_dm_device_collections_) {
+-        device_collection->disable_all();
+-    }
++    apply_to_all_collections(sub_dm_device_collections_,
++                             [](damiao_motor::DMDeviceCollection& device_collection) {
++                                 device_collection.disable_all();
++                             });
+ }
+ 
+ void OpenArm::recv_all(int first_timeout_us) {
+diff --git a/src/openarm/damiao_motor/dm_motor.cpp b/src/openarm/damiao_motor/dm_motor.cpp
+index b9dc45ce8936b06684abf1f30858077cea0747e9..fc80b5ed00888384e4f384320ebe70770fac33a6 100644
+--- a/src/openarm/damiao_motor/dm_motor.cpp
++++ b/src/openarm/damiao_motor/dm_motor.cpp
+@@ -24,7 +24,7 @@ Motor::Motor(MotorType motor_type, uint32_t send_can_id, uint32_t recv_can_id)
+     : send_can_id_(send_can_id),
+       recv_can_id_(recv_can_id),
+       motor_type_(motor_type),
+-      enabled_(false),
++      status_(-1),
+       state_update_count_(0),
+       state_q_(0.0),
+       state_dq_(0.0),
+@@ -32,8 +32,8 @@ Motor::Motor(MotorType motor_type, uint32_t send_can_id, uint32_t recv_can_id)
+       state_tmos_(0),
+       state_trotor_(0) {}
+ 
+-// Enable methods
+-void Motor::set_enabled(bool enable) { this->enabled_ = enable; }
++// Exact status methods
++void Motor::set_status(int status) { status_ = status; }
+ 
+ // Parameter methods
+ // TODO: storing temp params in motor object might not be a good idea
+diff --git a/src/openarm/damiao_motor/dm_motor_control.cpp b/src/openarm/damiao_motor/dm_motor_control.cpp
+index 1ff8fa6cbe44a5179f3cfb584b254204169f0c6f..09229930cf1198c19dab90f4a76651ad590157f7 100644
+--- a/src/openarm/damiao_motor/dm_motor_control.cpp
++++ b/src/openarm/damiao_motor/dm_motor_control.cpp
+@@ -93,6 +93,14 @@ StateResult CanPacketDecoder::parse_motor_state_data(const Motor& motor,
+         return {0, 0, 0, 0, 0, 0, false};
+     }
+ 
++    const uint32_t expected_motor_id = motor.get_send_can_id();
++    const uint8_t response_motor_id = data[0] & 0x0F;
++    if (expected_motor_id > 0x0F || response_motor_id != expected_motor_id) {
++        std::cerr << "WARNING: MOTOR STATE PAYLOAD ID DOES NOT MATCH TARGET MOTOR ID"
++                  << std::endl;
++        return {0, 0, 0, 0, 0, 0, false};
++    }
++
+     // Parse state data
+     int status = static_cast<int>(data[0] >> 4);
+     uint16_t q_uint = (static_cast<uint16_t>(data[1]) << 8) | data[2];
+diff --git a/src/openarm/damiao_motor/dm_motor_device.cpp b/src/openarm/damiao_motor/dm_motor_device.cpp
+index 4949dfc4b890927e351f0b41cc15136a69d91fe4..afa5fa26a9261f47df75954c54e0eec503ba256e 100644
+--- a/src/openarm/damiao_motor/dm_motor_device.cpp
++++ b/src/openarm/damiao_motor/dm_motor_device.cpp
+@@ -48,7 +48,7 @@ void DMCANDevice::callback(const can_frame& frame) {
+                 // Convert frame data to vector and let Motor handle parsing
+                 StateResult result = CanPacketDecoder::parse_motor_state_data(motor_, data);
+                 if (frame.can_id == motor_.get_recv_can_id() && result.valid) {
+-                    motor_.set_enabled(result.status == 1);
++                    motor_.set_status(result.status);
+                     motor_.update_state(result.position, result.velocity, result.torque,
+                                         result.t_mos, result.t_rotor);
+                 }
+@@ -83,7 +83,7 @@ void DMCANDevice::callback(const canfd_frame& frame) {
+     if (callback_mode_ == STATE) {
+         StateResult result = CanPacketDecoder::parse_motor_state_data(motor_, data);
+         if (result.valid) {
+-            motor_.set_enabled(result.status == 1);
++            motor_.set_status(result.status);
+             motor_.update_state(result.position, result.velocity, result.torque, result.t_mos,
+                                 result.t_rotor);
+         }
+diff --git a/src/openarm/damiao_motor/dm_motor_device_collection.cpp b/src/openarm/damiao_motor/dm_motor_device_collection.cpp
+index 2f2fc9b08d49be28625dd8fb245e3273b90bb7b3..5ed47dbb4bf7f50f73e6be71ff4f96edee65f5f0 100644
+--- a/src/openarm/damiao_motor/dm_motor_device_collection.cpp
++++ b/src/openarm/damiao_motor/dm_motor_device_collection.cpp
+@@ -17,6 +17,7 @@
+ 
+ #include <iostream>
+ #include <openarm/damiao_motor/dm_motor_device_collection.hpp>
++#include <stdexcept>
+ 
+ namespace openarm::damiao_motor {
+ 
+@@ -27,17 +28,25 @@ DMDeviceCollection::DMDeviceCollection(canbus::CANSocket& can_socket)
+       device_collection_(std::make_unique<canbus::CANDeviceCollection>(can_socket_)) {}
+ 
+ void DMDeviceCollection::enable_all() {
++    bool all_sent = true;
+     for (auto dm_device : get_dm_devices()) {
+         auto& motor = dm_device->get_motor();
+         CANPacket enable_packet = CanPacketEncoder::create_enable_command(motor);
+-        send_command_to_device(dm_device, enable_packet);
++        if (!send_command_to_device(dm_device, enable_packet)) all_sent = false;
++    }
++    if (!all_sent) {
++        throw std::runtime_error("Failed to send enable command to one or more motors");
+     }
+ }
+ 
+ void DMDeviceCollection::disable_all() {
++    bool all_sent = true;
+     for (auto dm_device : get_dm_devices()) {
+         CANPacket disable_packet = CanPacketEncoder::create_disable_command(dm_device->get_motor());
+-        send_command_to_device(dm_device, disable_packet);
++        if (!send_command_to_device(dm_device, disable_packet)) all_sent = false;
++    }
++    if (!all_sent) {
++        throw std::runtime_error("Failed to send disable command to one or more motors");
+     }
+ }
+ 
+@@ -62,10 +71,14 @@ void DMDeviceCollection::refresh_one(int i) {
+ }
+ 
+ void DMDeviceCollection::refresh_all() {
++    bool all_sent = true;
+     for (auto dm_device : get_dm_devices()) {
+         auto& motor = dm_device->get_motor();
+         CANPacket refresh_packet = CanPacketEncoder::create_refresh_command(motor);
+-        send_command_to_device(dm_device, refresh_packet);
++        if (!send_command_to_device(dm_device, refresh_packet)) all_sent = false;
++    }
++    if (!all_sent) {
++        throw std::runtime_error("Failed to send refresh command to one or more motors");
+     }
+ }
+ 
+@@ -102,31 +115,57 @@ void DMDeviceCollection::set_control_mode_all(ControlMode mode) {
+     }
+ }
+ 
+-void DMDeviceCollection::send_command_to_device(std::shared_ptr<DMCANDevice> dm_device,
++bool DMDeviceCollection::send_command_to_device(std::shared_ptr<DMCANDevice> dm_device,
+                                                 const CANPacket& packet) {
+     if (can_socket_.is_canfd_enabled()) {
+         canfd_frame frame = dm_device->create_canfd_frame(packet.send_can_id, packet.data);
+-        can_socket_.write_canfd_frame(frame);
++        return can_socket_.write_canfd_frame(frame);
+     } else {
+         can_frame frame = dm_device->create_can_frame(packet.send_can_id, packet.data);
+-        can_socket_.write_can_frame(frame);
++        return can_socket_.write_can_frame(frame);
+     }
+ }
+ 
+ void DMDeviceCollection::mit_control_one(int i, const MITParam& mit_param) {
+     auto dm_device = get_dm_devices()[i];
+     if (dm_device->get_control_mode() != ControlMode::MIT) {
+-        std::cerr << "WARNING: MIT control rejected; motor not in MIT mode." << std::endl;
+-        return;
++        throw std::logic_error("MIT control rejected; motor not in MIT mode");
+     }
+     CANPacket mit_cmd =
+         CanPacketEncoder::create_mit_control_command(dm_device->get_motor(), mit_param);
+-    send_command_to_device(dm_device, mit_cmd);
++    if (!send_command_to_device(dm_device, mit_cmd)) {
++        throw std::runtime_error("Failed to send MIT control command");
++    }
+ }
+ 
+ void DMDeviceCollection::mit_control_all(const std::vector<MITParam>& mit_params) {
+-    for (size_t i = 0; i < mit_params.size(); i++) {
+-        mit_control_one(i, mit_params[i]);
++    const auto dm_devices = get_dm_devices();
++    if (mit_params.size() != dm_devices.size()) {
++        throw std::invalid_argument("MIT parameter count must match motor count");
++    }
++
++    bool mode_error = false;
++    bool write_error = false;
++    for (size_t i = 0; i < dm_devices.size(); ++i) {
++        const auto& dm_device = dm_devices[i];
++        if (dm_device->get_control_mode() != ControlMode::MIT) {
++            mode_error = true;
++            continue;
++        }
++        CANPacket mit_cmd =
++            CanPacketEncoder::create_mit_control_command(dm_device->get_motor(), mit_params[i]);
++        if (!send_command_to_device(dm_device, mit_cmd)) write_error = true;
++    }
++
++    if (mode_error && write_error) {
++        throw std::runtime_error(
++            "MIT control failed: one or more motors had a mode error and one or more writes failed");
++    }
++    if (mode_error) {
++        throw std::logic_error("MIT control rejected; one or more motors not in MIT mode");
++    }
++    if (write_error) {
++        throw std::runtime_error("Failed to send MIT control command to one or more motors");
+     }
+ }
+ 

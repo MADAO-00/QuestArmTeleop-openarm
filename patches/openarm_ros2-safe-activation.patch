@@ -1,0 +1,489 @@
+diff --git a/openarm_hardware/include/openarm_hardware/openarm_simple_hardware.hpp b/openarm_hardware/include/openarm_hardware/openarm_simple_hardware.hpp
+index b3fba4e..b993a2b 100644
+--- a/openarm_hardware/include/openarm_hardware/openarm_simple_hardware.hpp
++++ b/openarm_hardware/include/openarm_hardware/openarm_simple_hardware.hpp
+@@ -15,5 +15,6 @@
+ #pragma once
+ 
++#include <array>
+ #include <chrono>
+ #include <memory>
+ #include <openarm/can/socket/openarm.hpp>
+@@ -134,6 +135,10 @@ class OpenArmHW : public hardware_interface::SystemInterface {
+   std::vector<double> vel_states_;
+   std::vector<double> tau_states_;
+ 
++  std::array<double, ARM_DOF> last_accepted_positions_{};
++  std::array<double, ARM_DOF> position_tokens_{};
++  bool command_gate_seeded_ = false;
++
+   static constexpr std::array<double, ARM_DOF> ZERO_POSITION = {
+       0.0,  // joint1
+       0.0,  // joint2
+@@ -147,6 +152,9 @@ class OpenArmHW : public hardware_interface::SystemInterface {
+ 
+   // Helper methods
+   void return_to_zero();
++  bool wait_for_fresh_feedback(bool expected_enabled, const char* phase);
++  bool seed_commands_from_feedback();
++  void best_effort_disable() noexcept;
+   bool parse_config(const hardware_interface::HardwareInfo& info);
+   void generate_joint_names();
+ 
+diff --git a/openarm_hardware/src/openarm_simple_hardware.cpp b/openarm_hardware/src/openarm_simple_hardware.cpp
+index 89f894e..016bad2 100644
+--- a/openarm_hardware/src/openarm_simple_hardware.cpp
++++ b/openarm_hardware/src/openarm_simple_hardware.cpp
+@@ -16,7 +16,10 @@
+ 
++#include <array>
+ #include <algorithm>
+ #include <cctype>
++#include <cmath>
+ #include <chrono>
++#include <exception>
+ #include <thread>
+ #include <vector>
+ 
+@@ -26,6 +29,33 @@
+ 
+ namespace openarm_hardware {
+ 
++namespace {
++constexpr int FEEDBACK_ATTEMPTS = 3;
++constexpr int FEEDBACK_TIMEOUT_US = 5000;
++constexpr double MAX_ABS_FEEDBACK_VELOCITY = 0.75;
++constexpr int MAX_FEEDBACK_TEMPERATURE = 70;
++constexpr std::array<double, 7> MAX_ABS_FEEDBACK_TORQUE = {
++    40.0, 40.0, 27.0, 27.0, 7.0, 7.0, 7.0};
++constexpr double MAX_ABS_GRIPPER_FEEDBACK_TORQUE = 7.0;
++// Exact hard position limits from the pinned official OpenArm v1 bimanual model.
++constexpr std::array<double, 7> LEFT_LOWER_POSITION_LIMITS = {
++    -3.490659, -3.3161253267948965, -1.570796, 0.0,
++    -1.570796, -0.785398, -1.570796};
++constexpr std::array<double, 7> LEFT_UPPER_POSITION_LIMITS = {
++    1.3962629999999998, 0.17453267320510335, 1.570796, 2.443461,
++    1.570796, 0.785398, 1.570796};
++constexpr std::array<double, 7> RIGHT_LOWER_POSITION_LIMITS = {
++    -1.396263, -0.17453267320510335, -1.570796, 0.0,
++    -1.570796, -0.785398, -1.570796};
++constexpr std::array<double, 7> RIGHT_UPPER_POSITION_LIMITS = {
++    3.490659, 3.3161253267948965, 1.570796, 2.443461,
++    1.570796, 0.785398, 1.570796};
++constexpr std::array<double, 7> MAX_COMMAND_VELOCITY = {
++    0.20, 0.20, 0.25, 0.25, 0.35, 0.35, 0.35};
++constexpr double POSITION_TOKEN_BURST_SECONDS = 0.050;
++constexpr double MAX_TRACKING_ERROR = 0.12;
++}  // namespace
++
+ OpenArmHW::OpenArmHW() = default;
+ 
+ bool OpenArmHW::parse_config(const hardware_interface::HardwareInfo& info) {
+@@ -38,10 +68,15 @@ bool OpenArmHW::parse_config(const hardware_interface::HardwareInfo& info) {
+   it = info.hardware_parameters.find("arm_prefix");
+   arm_prefix_ = (it != info.hardware_parameters.end()) ? it->second : "";
++  if (arm_prefix_ != "left_" && arm_prefix_ != "right_") {
++    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                 "Safety-gated real hardware requires arm_prefix=left_ or right_");
++    return false;
++  }
+ 
+-  // Parse gripper enable (default: true for V10)
++  // The safe default is arm-only. A gripper must be explicitly requested.
+   it = info.hardware_parameters.find("hand");
+   if (it == info.hardware_parameters.end()) {
+-    hand_ = true;  // Default to true for V10
++    hand_ = false;
+   } else {
+     // Handle both "true"/"True" and "false"/"False"
+     std::string value = it->second;
+@@ -220,19 +255,235 @@ OpenArmHW::export_command_interfaces() {
+   return command_interfaces;
+ }
+ 
++bool OpenArmHW::wait_for_fresh_feedback(bool expected_enabled,
++                                        const char* phase) {
++  // Keep one baseline across bounded retries so replies that arrive in
++  // separate socket drains still count toward one complete fresh sample.
++  const auto arm_before = openarm_->get_arm().get_motors();
++  const auto gripper_before =
++      hand_ ? openarm_->get_gripper().get_motors()
++            : std::vector<openarm::damiao_motor::Motor>{};
++
++  for (int attempt = 1; attempt <= FEEDBACK_ATTEMPTS; ++attempt) {
++    openarm_->refresh_all();
++    openarm_->recv_all(FEEDBACK_TIMEOUT_US);
++
++    const auto arm_after = openarm_->get_arm().get_motors();
++    const auto gripper_after =
++        hand_ ? openarm_->get_gripper().get_motors()
++              : std::vector<openarm::damiao_motor::Motor>{};
++
++    bool valid = arm_before.size() == ARM_DOF && arm_after.size() == ARM_DOF;
++    if (hand_) {
++      valid = valid && gripper_before.size() == 1 && gripper_after.size() == 1;
++    }
++
++    auto validate_motor = [&](const openarm::damiao_motor::Motor& before,
++                              const openarm::damiao_motor::Motor& after,
++                              double max_abs_torque) {
++      return after.state_update_count() > before.state_update_count() &&
++             std::isfinite(after.get_position()) &&
++             std::isfinite(after.get_velocity()) &&
++             std::isfinite(after.get_torque()) &&
++             std::abs(after.get_velocity()) <= MAX_ABS_FEEDBACK_VELOCITY &&
++             std::abs(after.get_torque()) <= max_abs_torque &&
++             after.get_state_tmos() >= 0 &&
++             after.get_state_tmos() <= MAX_FEEDBACK_TEMPERATURE &&
++             after.get_state_trotor() >= 0 &&
++             after.get_state_trotor() <= MAX_FEEDBACK_TEMPERATURE &&
++             after.is_enabled() == expected_enabled;
++    };
++
++    if (valid) {
++      for (size_t i = 0; i < ARM_DOF; ++i) {
++        if (!validate_motor(arm_before[i], arm_after[i],
++                            MAX_ABS_FEEDBACK_TORQUE[i])) {
++          valid = false;
++          break;
++        }
++      }
++    }
++    if (valid && hand_ &&
++        !validate_motor(gripper_before.front(), gripper_after.front(),
++                        MAX_ABS_GRIPPER_FEEDBACK_TORQUE)) {
++      valid = false;
++    }
++
++    if (valid) {
++      return true;
++    }
++
++    RCLCPP_WARN(rclcpp::get_logger("OpenArmHW"),
++                "Fresh %s feedback validation failed during %s "
++                "(attempt %d/%d)",
++                expected_enabled ? "enabled" : "disabled", phase, attempt,
++                FEEDBACK_ATTEMPTS);
++  }
++
++  return false;
++}
++
++bool OpenArmHW::seed_commands_from_feedback() {
++  command_gate_seeded_ = false;
++  const auto arm_motors = openarm_->get_arm().get_motors();
++  if (arm_motors.size() != ARM_DOF || pos_commands_.size() != joint_names_.size()) {
++    return false;
++  }
++  const auto& lower_limits = arm_prefix_ == "left_"
++                                 ? LEFT_LOWER_POSITION_LIMITS
++                                 : RIGHT_LOWER_POSITION_LIMITS;
++  const auto& upper_limits = arm_prefix_ == "left_"
++                                 ? LEFT_UPPER_POSITION_LIMITS
++                                 : RIGHT_UPPER_POSITION_LIMITS;
++
++  for (size_t i = 0; i < ARM_DOF; ++i) {
++    const double position = arm_motors[i].get_position();
++    const double velocity = arm_motors[i].get_velocity();
++    const double torque = arm_motors[i].get_torque();
++    if (!std::isfinite(position) || !std::isfinite(velocity) ||
++        !std::isfinite(torque) || position < lower_limits[i] ||
++        position > upper_limits[i]) {
++      return false;
++    }
++    pos_states_[i] = position;
++    vel_states_[i] = velocity;
++    tau_states_[i] = torque;
++    pos_commands_[i] = position;
++    vel_commands_[i] = 0.0;
++    tau_commands_[i] = 0.0;
++    last_accepted_positions_[i] = position;
++    position_tokens_[i] =
++        MAX_COMMAND_VELOCITY[i] * POSITION_TOKEN_BURST_SECONDS;
++  }
++
++  if (hand_) {
++    const auto gripper_motors = openarm_->get_gripper().get_motors();
++    if (gripper_motors.size() != 1 || joint_names_.size() != ARM_DOF + 1) {
++      return false;
++    }
++    const double motor_position = gripper_motors.front().get_position();
++    const double joint_position = motor_radians_to_joint(motor_position);
++    if (!std::isfinite(joint_position)) {
++      return false;
++    }
++    pos_states_[ARM_DOF] = joint_position;
++    vel_states_[ARM_DOF] = 0.0;
++    tau_states_[ARM_DOF] = 0.0;
++    pos_commands_[ARM_DOF] = joint_position;
++    vel_commands_[ARM_DOF] = 0.0;
++    tau_commands_[ARM_DOF] = 0.0;
++  }
++
++  command_gate_seeded_ = true;
++  return true;
++}
++
++void OpenArmHW::best_effort_disable() noexcept {
++  try {
++    openarm_->set_callback_mode_all(openarm::damiao_motor::CallbackMode::STATE);
++    for (int attempt = 0; attempt < FEEDBACK_ATTEMPTS; ++attempt) {
++      openarm_->disable_all();
++      openarm_->recv_all(FEEDBACK_TIMEOUT_US);
++    }
++  } catch (const std::exception& exception) {
++    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                 "Fail-safe disable raised an exception: %s", exception.what());
++  } catch (...) {
++    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                 "Fail-safe disable raised an unknown exception");
++  }
++}
++
+ hardware_interface::CallbackReturn OpenArmHW::on_activate(
+     const rclcpp_lifecycle::State& /*previous_state*/) {
+-  RCLCPP_INFO(rclcpp::get_logger("OpenArmHW"), "Activating OpenArm V10...");
+-  openarm_->set_callback_mode_all(openarm::damiao_motor::CallbackMode::STATE);
+-  openarm_->enable_all();
+-  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+-  openarm_->recv_all();
+-
+-  // Return to zero position
+-  return_to_zero();
+-
+-  RCLCPP_INFO(rclcpp::get_logger("OpenArmHW"), "OpenArm V10 activated");
+-  return CallbackReturn::SUCCESS;
++  auto fail_activation = [&](const char* reason) {
++    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                 "OpenArm activation rejected: %s", reason);
++    best_effort_disable();
++    rclcpp::shutdown();
++    return CallbackReturn::ERROR;
++  };
++
++  try {
++    RCLCPP_INFO(rclcpp::get_logger("OpenArmHW"),
++                "Activating OpenArm V10 in current-position hold mode...");
++    openarm_->set_callback_mode_all(openarm::damiao_motor::CallbackMode::STATE);
++
++    // Always establish and verify a fresh disabled baseline first. The update
++    // counter comes from actual decoded CAN replies, so constructor zeroes can
++    // never be mistaken for live feedback.
++    best_effort_disable();
++    if (!wait_for_fresh_feedback(false, "pre-activation baseline")) {
++      return fail_activation("motors did not report a fresh disabled state");
++    }
++    if (!seed_commands_from_feedback()) {
++      return fail_activation("current feedback could not seed hold commands");
++    }
++
++    // Preload the current position while disabled, with zero gains and zero
++    // feed-forward torque. This cannot request motion even if a frame is
++    // interpreted before the explicit enable transition.
++    std::vector<openarm::damiao_motor::MITParam> preload_params;
++    preload_params.reserve(ARM_DOF);
++    for (size_t i = 0; i < ARM_DOF; ++i) {
++      preload_params.push_back({0.0, 0.0, pos_commands_[i], 0.0, 0.0});
++    }
++    openarm_->get_arm().mit_control_all(preload_params);
++    if (hand_) {
++      openarm_->get_gripper().mit_control_all(
++          {{0.0, 0.0, joint_to_motor_radians(pos_commands_[ARM_DOF]), 0.0,
++            0.0}});
++    }
++    openarm_->recv_all(FEEDBACK_TIMEOUT_US);
++    if (!wait_for_fresh_feedback(false, "disabled command preload")) {
++      return fail_activation("disabled preload was not confirmed");
++    }
++
++    // Enabling does not select a new pose. Confirm every motor's fresh enabled
++    // status before applying the finite current-position hold command.
++    openarm_->enable_all();
++    if (!wait_for_fresh_feedback(true, "enable confirmation")) {
++      return fail_activation("not every arm motor confirmed enabled");
++    }
++    // Re-sample after the zero-gain enable window. The full-gain hold must use
++    // the actual enabled pose, never the older pre-enable position.
++    if (!seed_commands_from_feedback()) {
++      return fail_activation("enabled feedback could not reseed hold commands");
++    }
++
++    std::vector<openarm::damiao_motor::MITParam> hold_params;
++    hold_params.reserve(ARM_DOF);
++    for (size_t i = 0; i < ARM_DOF; ++i) {
++      hold_params.push_back(
++          {kp_[i], kd_[i], pos_commands_[i], 0.0, 0.0});
++    }
++    openarm_->get_arm().mit_control_all(hold_params);
++    if (hand_) {
++      openarm_->get_gripper().mit_control_all(
++          {{gripper_kp_, gripper_kd_,
++            joint_to_motor_radians(pos_commands_[ARM_DOF]), 0.0, 0.0}});
++    }
++    openarm_->recv_all(FEEDBACK_TIMEOUT_US);
++    if (!wait_for_fresh_feedback(true, "initial current-position hold")) {
++      return fail_activation("initial current-position hold was not confirmed");
++    }
++
++    RCLCPP_INFO(rclcpp::get_logger("OpenArmHW"),
++                "OpenArm V10 activated at the measured current position");
++    return CallbackReturn::SUCCESS;
++  } catch (const std::exception& exception) {
++    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                 "OpenArm activation exception: %s", exception.what());
++    best_effort_disable();
++    rclcpp::shutdown();
++    return CallbackReturn::ERROR;
++  } catch (...) {
++    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                 "OpenArm activation failed with an unknown exception");
++    best_effort_disable();
++    rclcpp::shutdown();
++    return CallbackReturn::ERROR;
++  }
+ }
+ 
+ hardware_interface::CallbackReturn OpenArmHW::on_deactivate(
+@@ -253,7 +504,13 @@ hardware_interface::return_type OpenArmHW::read(
+ hardware_interface::return_type OpenArmHW::read(
+     const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/) {
+-  // Receive all motor states
+-  openarm_->refresh_all();
+-  openarm_->recv_all();
++  try {
++  if (!wait_for_fresh_feedback(true, "runtime read")) {
++    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                 "Fresh enabled feedback was not received for every motor; "
++                 "disabling hardware instead of publishing stale state");
++    best_effort_disable();
++    rclcpp::shutdown();
++    return hardware_interface::return_type::ERROR;
++  }
+ 
+   // Read arm joint states
+@@ -279,11 +536,109 @@ hardware_interface::return_type OpenArmHW::read(
+     }
+   }
+ 
+   return hardware_interface::return_type::OK;
++  } catch (const std::exception& exception) {
++    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                 "OpenArm runtime read exception: %s", exception.what());
++    best_effort_disable();
++    rclcpp::shutdown();
++    return hardware_interface::return_type::ERROR;
++  } catch (...) {
++    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                 "OpenArm runtime read failed with an unknown exception");
++    best_effort_disable();
++    rclcpp::shutdown();
++    return hardware_interface::return_type::ERROR;
++  }
+ }
+ 
+ hardware_interface::return_type OpenArmHW::write(
+-    const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/) {
++    const rclcpp::Time& /*time*/, const rclcpp::Duration& period) {
++  auto runtime_fault = [&]() {
++    best_effort_disable();
++    rclcpp::shutdown();
++    return hardware_interface::return_type::ERROR;
++  };
++  const auto all_finite = [](const std::vector<double>& values) {
++    return std::all_of(values.begin(), values.end(),
++                       [](double value) { return std::isfinite(value); });
++  };
++  if (pos_commands_.size() != joint_names_.size() ||
++      vel_commands_.size() != joint_names_.size() ||
++      tau_commands_.size() != joint_names_.size() ||
++      !all_finite(pos_commands_) || !all_finite(vel_commands_) ||
++      !all_finite(tau_commands_)) {
++    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                 "Rejected non-finite or malformed hardware command; "
++                 "disabling motors");
++    return runtime_fault();
++  }
++  if (!command_gate_seeded_ || pos_states_.size() < ARM_DOF) {
++    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                 "Rejected command before the hardware safety gate was seeded");
++    return runtime_fault();
++  }
++
++  const double period_seconds = period.seconds();
++  if (!std::isfinite(period_seconds) || period_seconds < 0.0) {
++    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                 "Rejected command with invalid controller period");
++    return runtime_fault();
++  }
++  const double bounded_period =
++      std::min(period_seconds, POSITION_TOKEN_BURST_SECONDS);
++  const auto& lower_limits = arm_prefix_ == "left_"
++                                 ? LEFT_LOWER_POSITION_LIMITS
++                                 : RIGHT_LOWER_POSITION_LIMITS;
++  const auto& upper_limits = arm_prefix_ == "left_"
++                                 ? LEFT_UPPER_POSITION_LIMITS
++                                 : RIGHT_UPPER_POSITION_LIMITS;
++  auto next_tokens = position_tokens_;
++
++  for (size_t i = 0; i < ARM_DOF; ++i) {
++    if (pos_commands_[i] < lower_limits[i] ||
++        pos_commands_[i] > upper_limits[i]) {
++      RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                   "Rejected joint %zu position outside the %s safety limit",
++                   i + 1, arm_prefix_.c_str());
++      return runtime_fault();
++    }
++    if (vel_commands_[i] != 0.0 || tau_commands_[i] != 0.0) {
++      RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                   "Rejected non-zero velocity/effort command for joint %zu",
++                   i + 1);
++      return runtime_fault();
++    }
++    if (!std::isfinite(pos_states_[i]) ||
++        std::abs(pos_commands_[i] - pos_states_[i]) > MAX_TRACKING_ERROR) {
++      RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                   "Rejected joint %zu command with excessive tracking error",
++                   i + 1);
++      return runtime_fault();
++    }
++
++    const double capacity =
++        MAX_COMMAND_VELOCITY[i] * POSITION_TOKEN_BURST_SECONDS;
++    next_tokens[i] =
++        std::min(capacity,
++                 next_tokens[i] + MAX_COMMAND_VELOCITY[i] * bounded_period);
++    const double requested_step =
++        std::abs(pos_commands_[i] - last_accepted_positions_[i]);
++    if (requested_step > next_tokens[i] + 1e-12) {
++      RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                   "Rejected joint %zu command exceeding the hardware rate gate",
++                   i + 1);
++      return runtime_fault();
++    }
++    next_tokens[i] -= requested_step;
++  }
++
++  position_tokens_ = next_tokens;
++  for (size_t i = 0; i < ARM_DOF; ++i) {
++    last_accepted_positions_[i] = pos_commands_[i];
++  }
++
++  try {
+   // Control arm motors with MIT control
+   std::vector<openarm::damiao_motor::MITParam> arm_params;
+   for (size_t i = 0; i < ARM_DOF; ++i) {
+@@ -299,5 +654,14 @@ hardware_interface::return_type OpenArmHW::write(
+         {{gripper_kp_, gripper_kd_, motor_command, 0.0, 0.0}});
+   }
+   openarm_->recv_all(100);
+   return hardware_interface::return_type::OK;
++  } catch (const std::exception& exception) {
++    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                 "OpenArm runtime write exception: %s", exception.what());
++    return runtime_fault();
++  } catch (...) {
++    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                 "OpenArm runtime write failed with an unknown exception");
++    return runtime_fault();
++  }
+ }

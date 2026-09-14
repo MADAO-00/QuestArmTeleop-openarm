@@ -1,0 +1,80 @@
+# OpenArm v1 dual-arm and dual-gripper ros2_control configuration.
+#
+# The two seven-axis arm controllers and two one-axis gripper controllers are
+# all streaming ForwardCommandControllers.  Only openarm_command_guard publishes
+# to these command topics during Quest TELEOP.
+
+controller_manager:
+  ros__parameters:
+    # OpenArm v1's official MoveIt controller configuration uses 100 Hz.  The
+    # Quest intent/IK path runs at 50 Hz, so 100 Hz preserves one hardware
+    # update between intent samples while leaving enough CAN-FD/USB headroom for
+    # all seven arm replies plus the last-sent ID8 gripper reply on each bus.
+    update_rate: 100
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    left_forward_position_controller:
+      type: forward_command_controller/ForwardCommandController
+
+    right_forward_position_controller:
+      type: forward_command_controller/ForwardCommandController
+
+    left_gripper_forward_position_controller:
+      type: forward_command_controller/ForwardCommandController
+
+    right_gripper_forward_position_controller:
+      type: forward_command_controller/ForwardCommandController
+
+left_forward_position_controller:
+  ros__parameters:
+    joints:
+      - openarm_left_joint1
+      - openarm_left_joint2
+      - openarm_left_joint3
+      - openarm_left_joint4
+      - openarm_left_joint5
+      - openarm_left_joint6
+      - openarm_left_joint7
+    interface_name: position
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+
+right_forward_position_controller:
+  ros__parameters:
+    joints:
+      - openarm_right_joint1
+      - openarm_right_joint2
+      - openarm_right_joint3
+      - openarm_right_joint4
+      - openarm_right_joint5
+      - openarm_right_joint6
+      - openarm_right_joint7
+    interface_name: position
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+
+left_gripper_forward_position_controller:
+  ros__parameters:
+    joints:
+      - openarm_left_finger_joint1
+    interface_name: position
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+
+right_gripper_forward_position_controller:
+  ros__parameters:
+    joints:
+      - openarm_right_finger_joint1
+    interface_name: position
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position

@@ -1,0 +1,466 @@
+--- a/openarm_hardware/include/openarm_hardware/openarm_simple_hardware.hpp
++++ b/openarm_hardware/include/openarm_hardware/openarm_simple_hardware.hpp
+@@ -140,6 +140,8 @@
+ 
+   std::array<double, ARM_DOF> last_accepted_positions_{};
+   std::array<double, ARM_DOF> position_tokens_{};
++  double last_accepted_gripper_position_ = 0.0;
++  double gripper_position_tokens_ = 0.0;
+   bool command_gate_seeded_ = false;
+   std::array<uint64_t, ARM_DOF> runtime_feedback_counts_{};
+   std::array<std::chrono::steady_clock::time_point, ARM_DOF>
+@@ -170,6 +172,7 @@
+   bool seed_runtime_feedback_watchdog();
+   bool bootstrap_runtime_feedback();
+   bool collect_runtime_feedback();
++  bool verify_gripper_mit_mode_ack();
+   bool seed_commands_from_feedback();
+   bool best_effort_disable() noexcept;
+   bool parse_config(const hardware_interface::HardwareInfo& info);
+--- a/openarm_hardware/src/openarm_simple_hardware.cpp
++++ b/openarm_hardware/src/openarm_simple_hardware.cpp
+@@ -55,6 +55,13 @@
+     0.20, 0.20, 0.25, 0.25, 0.35, 0.35, 0.35};
+ constexpr double POSITION_TOKEN_BURST_SECONDS = 0.050;
+ constexpr double MAX_TRACKING_ERROR = 0.12;
++constexpr double MAX_ABS_GRIPPER_FEEDBACK_VELOCITY = 1.05;
++constexpr double GRIPPER_LOWER_POSITION_LIMIT = 0.0;
++constexpr double GRIPPER_UPPER_POSITION_LIMIT = 0.044;
++constexpr double GRIPPER_FEEDBACK_POSITION_TOLERANCE = 0.00002;
++constexpr double MAX_GRIPPER_TRACKING_ERROR = 0.00504;
++constexpr double MAX_GRIPPER_COMMAND_VELOCITY = 0.0147;
++constexpr auto GRIPPER_MODE_ACK_TIMEOUT = std::chrono::milliseconds(100);
+ }  // namespace
+ 
+ OpenArmHW::OpenArmHW() = default;
+@@ -112,6 +119,11 @@
+   ee_type_ =
+       (it != info.hardware_parameters.end()) ? it->second : "parallel_link";
+   if (hand_) {
++    if (ee_type_ != "parallel_link") {
++      RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                   "Safety-gated gripper requires ee_type=parallel_link");
++      return false;
++    }
+     it = info.hardware_parameters.find("kp_hand");
+     if (it != info.hardware_parameters.end()) {
+       gripper_kp_ = std::stod(it->second);
+@@ -120,6 +132,12 @@
+     if (it != info.hardware_parameters.end()) {
+       gripper_kd_ = std::stod(it->second);
+     }
++    if (!std::isfinite(gripper_kp_) || !std::isfinite(gripper_kd_) ||
++        gripper_kp_ < 0.0 || gripper_kd_ < 0.0) {
++      RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                   "Rejected non-finite or negative gripper gains");
++      return false;
++    }
+   }
+ 
+   RCLCPP_INFO(rclcpp::get_logger("OpenArmHW"),
+@@ -195,7 +213,14 @@
+     RCLCPP_INFO(rclcpp::get_logger("OpenArmHW"), "Initializing gripper...");
+     openarm_->init_gripper_motor(DEFAULT_GRIPPER_MOTOR_TYPE,
+                                  DEFAULT_GRIPPER_SEND_CAN_ID,
+-                                 DEFAULT_GRIPPER_RECV_CAN_ID);
++                                 DEFAULT_GRIPPER_RECV_CAN_ID,
++                                 openarm::damiao_motor::ControlMode::MIT);
++    if (!verify_gripper_mit_mode_ack()) {
++      RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                   "Gripper CTRL_MODE=MIT acknowledgement was not verified");
++      best_effort_disable();
++      return CallbackReturn::ERROR;
++    }
+   }
+ 
+   // Initialize state and command vectors based on generated joint count
+@@ -353,13 +378,14 @@
+   auto gripper_after = gripper_before;
+   auto validate_motor = [&](const openarm::damiao_motor::Motor& before,
+                             const openarm::damiao_motor::Motor& after,
++                            double max_abs_velocity,
+                             double max_abs_torque) {
+     return after.state_update_count() != before.state_update_count() &&
+            after.get_status() == expected_status &&
+            std::isfinite(after.get_position()) &&
+            std::isfinite(after.get_velocity()) &&
+            std::isfinite(after.get_torque()) &&
+-           std::abs(after.get_velocity()) <= MAX_ABS_FEEDBACK_VELOCITY &&
++           std::abs(after.get_velocity()) <= max_abs_velocity &&
+            std::abs(after.get_torque()) <= max_abs_torque &&
+            after.get_state_tmos() >= 0 &&
+            after.get_state_tmos() <= MAX_FEEDBACK_TEMPERATURE &&
+@@ -388,6 +414,7 @@
+     if (valid) {
+       for (size_t i = 0; i < ARM_DOF; ++i) {
+         if (!validate_motor(arm_before[i], arm_after[i],
++                            MAX_ABS_FEEDBACK_VELOCITY,
+                             MAX_ABS_FEEDBACK_TORQUE[i])) {
+           valid = false;
+           break;
+@@ -396,6 +423,7 @@
+     }
+     if (valid && hand_ &&
+         !validate_motor(gripper_before.front(), gripper_after.front(),
++                        MAX_ABS_GRIPPER_FEEDBACK_VELOCITY,
+                         MAX_ABS_GRIPPER_FEEDBACK_TORQUE)) {
+       valid = false;
+     }
+@@ -418,6 +446,7 @@
+   auto log_motor = [&](const char* component, size_t axis,
+                        const openarm::damiao_motor::Motor& before,
+                        const openarm::damiao_motor::Motor& after,
++                       double max_abs_velocity,
+                        double max_abs_torque) {
+     const bool fresh =
+         after.state_update_count() != before.state_update_count();
+@@ -425,7 +454,7 @@
+                         std::isfinite(after.get_velocity()) &&
+                         std::isfinite(after.get_torque());
+     const bool velocity_ok =
+-        std::abs(after.get_velocity()) <= MAX_ABS_FEEDBACK_VELOCITY;
++        std::abs(after.get_velocity()) <= max_abs_velocity;
+     const bool torque_ok = std::abs(after.get_torque()) <= max_abs_torque;
+     const bool temperature_ok =
+         after.get_state_tmos() >= 0 &&
+@@ -435,24 +464,27 @@
+     RCLCPP_ERROR(
+         rclcpp::get_logger("OpenArmHW"),
+         "%s %s axis=%zu can_id=0x%02x count=%llu->%llu fresh=%s "
+-        "raw_status=%d expected=%d finite=%s velocity_ok=%s torque_ok=%s "
++        "raw_status=%d expected=%d finite=%s velocity_ok=%s "
++        "velocity_limit=%.6f torque_ok=%s "
+         "temperature_ok=%s q=%.6f dq=%.6f tau=%.6f tmos=%d trotor=%d",
+         phase, component, axis,
+         static_cast<unsigned int>(after.get_recv_can_id()),
+         static_cast<unsigned long long>(before.state_update_count()),
+         static_cast<unsigned long long>(after.state_update_count()),
+         fresh ? "yes" : "no", after.get_status(), expected_status,
+-        finite ? "yes" : "no", velocity_ok ? "yes" : "no",
++        finite ? "yes" : "no", velocity_ok ? "yes" : "no", max_abs_velocity,
+         torque_ok ? "yes" : "no", temperature_ok ? "yes" : "no",
+         after.get_position(), after.get_velocity(), after.get_torque(),
+         after.get_state_tmos(), after.get_state_trotor());
+   };
+   for (size_t i = 0; i < ARM_DOF; ++i) {
+     log_motor("arm", i + 1, arm_before[i], arm_after[i],
++              MAX_ABS_FEEDBACK_VELOCITY,
+               MAX_ABS_FEEDBACK_TORQUE[i]);
+   }
+   if (hand_) {
+     log_motor("gripper", 1, gripper_before.front(), gripper_after.front(),
++              MAX_ABS_GRIPPER_FEEDBACK_VELOCITY,
+               MAX_ABS_GRIPPER_FEEDBACK_TORQUE);
+   }
+   return false;
+@@ -537,11 +569,12 @@
+   bool valid = true;
+ 
+   auto feedback_values_valid = [](const openarm::damiao_motor::Motor& motor,
++                                  double max_abs_velocity,
+                                   double max_abs_torque) {
+     return motor.get_status() == 1 && std::isfinite(motor.get_position()) &&
+            std::isfinite(motor.get_velocity()) &&
+            std::isfinite(motor.get_torque()) &&
+-           std::abs(motor.get_velocity()) <= MAX_ABS_FEEDBACK_VELOCITY &&
++           std::abs(motor.get_velocity()) <= max_abs_velocity &&
+            std::abs(motor.get_torque()) <= max_abs_torque &&
+            motor.get_state_tmos() >= 0 &&
+            motor.get_state_tmos() <= MAX_FEEDBACK_TEMPERATURE &&
+@@ -557,7 +590,8 @@
+       next_times[i] = now;
+     }
+     age_ms[i] = std::chrono::duration<double, std::milli>(now - next_times[i]).count();
+-    if (!feedback_values_valid(arm_motors[i], MAX_ABS_FEEDBACK_TORQUE[i]) ||
++    if (!feedback_values_valid(arm_motors[i], MAX_ABS_FEEDBACK_VELOCITY,
++                               MAX_ABS_FEEDBACK_TORQUE[i]) ||
+         now - next_times[i] > RUNTIME_FEEDBACK_MAX_AGE) {
+       valid = false;
+     }
+@@ -577,6 +611,7 @@
+     gripper_age_ms =
+         std::chrono::duration<double, std::milli>(now - next_gripper_time).count();
+     if (!feedback_values_valid(gripper_motors.front(),
++                               MAX_ABS_GRIPPER_FEEDBACK_VELOCITY,
+                                MAX_ABS_GRIPPER_FEEDBACK_TORQUE) ||
+         now - next_gripper_time > RUNTIME_FEEDBACK_MAX_AGE) {
+       valid = false;
+@@ -594,7 +629,8 @@
+   }
+ 
+   RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
+-               "Runtime feedback validation failed; max age is %.3f ms",
++               "Runtime feedback validation failed; inspect per-axis "
++               "predicates below (max age %.3f ms)",
+                std::chrono::duration<double, std::milli>(
+                    RUNTIME_FEEDBACK_MAX_AGE)
+                    .count());
+@@ -602,6 +638,7 @@
+                                const openarm::damiao_motor::Motor& motor,
+                                uint64_t previous_count, bool is_fresh,
+                                double feedback_age_ms,
++                               double max_abs_velocity,
+                                double max_abs_torque) {
+     const bool counter_changed =
+         motor.state_update_count() != previous_count;
+@@ -609,7 +646,7 @@
+                         std::isfinite(motor.get_velocity()) &&
+                         std::isfinite(motor.get_torque());
+     const bool velocity_ok =
+-        std::abs(motor.get_velocity()) <= MAX_ABS_FEEDBACK_VELOCITY;
++        std::abs(motor.get_velocity()) <= max_abs_velocity;
+     const bool torque_ok = std::abs(motor.get_torque()) <= max_abs_torque;
+     const bool temperature_ok =
+         motor.get_state_tmos() >= 0 &&
+@@ -620,14 +657,16 @@
+         rclcpp::get_logger("OpenArmHW"),
+         "runtime %s axis=%zu can_id=0x%02x count=%llu->%llu changed=%s "
+         "fresh=%s age_ms=%.3f raw_status=%d expected=1 finite=%s "
+-        "velocity_ok=%s torque_ok=%s temperature_ok=%s q=%.6f dq=%.6f "
++        "velocity_ok=%s velocity_limit=%.6f torque_ok=%s temperature_ok=%s "
++        "q=%.6f dq=%.6f "
+         "tau=%.6f tmos=%d trotor=%d",
+         component, axis, static_cast<unsigned int>(motor.get_recv_can_id()),
+         static_cast<unsigned long long>(previous_count),
+         static_cast<unsigned long long>(motor.state_update_count()),
+         counter_changed ? "yes" : "no", is_fresh ? "yes" : "no",
+         feedback_age_ms, motor.get_status(), finite ? "yes" : "no",
+-        velocity_ok ? "yes" : "no", torque_ok ? "yes" : "no",
++        velocity_ok ? "yes" : "no", max_abs_velocity,
++        torque_ok ? "yes" : "no",
+         temperature_ok ? "yes" : "no", motor.get_position(),
+         motor.get_velocity(), motor.get_torque(), motor.get_state_tmos(),
+         motor.get_state_trotor());
+@@ -635,18 +674,77 @@
+   for (size_t i = 0; i < ARM_DOF; ++i) {
+     log_runtime_motor("arm", i + 1, arm_motors[i],
+                       runtime_feedback_counts_[i], fresh[i], age_ms[i],
++                      MAX_ABS_FEEDBACK_VELOCITY,
+                       MAX_ABS_FEEDBACK_TORQUE[i]);
+   }
+   if (hand_) {
+     log_runtime_motor("gripper", 1, gripper_motors.front(),
+                       runtime_gripper_feedback_count_, gripper_fresh,
+-                      gripper_age_ms, MAX_ABS_GRIPPER_FEEDBACK_TORQUE);
++                      gripper_age_ms, MAX_ABS_GRIPPER_FEEDBACK_VELOCITY,
++                      MAX_ABS_GRIPPER_FEEDBACK_TORQUE);
++  }
++  return false;
++}
++
++bool OpenArmHW::verify_gripper_mit_mode_ack() {
++  if (!hand_) {
++    return true;
++  }
++  const auto gripper_motors = openarm_->get_gripper().get_motors();
++  if (gripper_motors.size() != 1) {
++    return false;
++  }
++
++  const int control_mode_rid =
++      static_cast<int>(openarm::damiao_motor::RID::CTRL_MODE);
++  // init_gripper_motor() creates a new Motor with an empty parameter map, then
++  // emits exactly one CTRL_MODE write while its callback is in PARAM mode. A
++  // non-sentinel value observed after this point is therefore the write ACK;
++  // the upstream API exposes no parameter-response generation counter.
++  if (gripper_motors.front().get_param(control_mode_rid) != -1.0) {
++    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                 "Gripper CTRL_MODE parameter was unexpectedly populated "
++                 "before acknowledgement receive");
++    return false;
++  }
++
++  const double expected_mode = static_cast<double>(
++      static_cast<int>(openarm::damiao_motor::ControlMode::MIT));
++  const auto deadline =
++      std::chrono::steady_clock::now() + GRIPPER_MODE_ACK_TIMEOUT;
++  while (std::chrono::steady_clock::now() < deadline) {
++    openarm_->recv_all(FEEDBACK_RECV_SLICE_US);
++    const auto after = openarm_->get_gripper().get_motors();
++    if (after.size() != 1) {
++      return false;
++    }
++    const double acknowledged_mode =
++        after.front().get_param(control_mode_rid);
++    if (acknowledged_mode == -1.0) {
++      continue;
++    }
++    if (!std::isfinite(acknowledged_mode) ||
++        acknowledged_mode != expected_mode) {
++      RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                   "Gripper CTRL_MODE acknowledgement was %.6f, expected "
++                   "MIT mode %.0f",
++                   acknowledged_mode, expected_mode);
++      return false;
++    }
++    RCLCPP_INFO(rclcpp::get_logger("OpenArmHW"),
++                "Verified gripper CTRL_MODE=MIT acknowledgement");
++    return true;
+   }
++
++  RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++               "Timed out waiting for gripper CTRL_MODE=MIT acknowledgement");
+   return false;
+ }
+ 
+ bool OpenArmHW::seed_commands_from_feedback() {
+   command_gate_seeded_ = false;
++  gripper_position_tokens_ = 0.0;
++  last_accepted_gripper_position_ = 0.0;
+   const auto arm_motors = openarm_->get_arm().get_motors();
+   if (arm_motors.size() != ARM_DOF || pos_commands_.size() != joint_names_.size()) {
+     return false;
+@@ -684,16 +782,29 @@
+       return false;
+     }
+     const double motor_position = gripper_motors.front().get_position();
+-    const double joint_position = motor_radians_to_joint(motor_position);
+-    if (!std::isfinite(joint_position)) {
++    const double motor_velocity = gripper_motors.front().get_velocity();
++    const double motor_torque = gripper_motors.front().get_torque();
++    const double raw_joint_position = motor_radians_to_joint(motor_position);
++    if (!std::isfinite(motor_position) || !std::isfinite(motor_velocity) ||
++        !std::isfinite(motor_torque) || !std::isfinite(raw_joint_position) ||
++        raw_joint_position < GRIPPER_LOWER_POSITION_LIMIT -
++                                 GRIPPER_FEEDBACK_POSITION_TOLERANCE ||
++        raw_joint_position > GRIPPER_UPPER_POSITION_LIMIT +
++                                 GRIPPER_FEEDBACK_POSITION_TOLERANCE) {
+       return false;
+     }
++    const double joint_position = std::clamp(
++        raw_joint_position, GRIPPER_LOWER_POSITION_LIMIT,
++        GRIPPER_UPPER_POSITION_LIMIT);
+     pos_states_[ARM_DOF] = joint_position;
+     vel_states_[ARM_DOF] = 0.0;
+     tau_states_[ARM_DOF] = 0.0;
+     pos_commands_[ARM_DOF] = joint_position;
+     vel_commands_[ARM_DOF] = 0.0;
+     tau_commands_[ARM_DOF] = 0.0;
++    last_accepted_gripper_position_ = joint_position;
++    gripper_position_tokens_ =
++        MAX_GRIPPER_COMMAND_VELOCITY * POSITION_TOKEN_BURST_SECONDS;
+   }
+ 
+   command_gate_seeded_ = true;
+@@ -886,18 +997,40 @@
+     }
+ 
+     // Read gripper state if enabled
+-    if (hand_ && joint_names_.size() > ARM_DOF) {
++    if (hand_) {
+       const auto& gripper_motors = openarm_->get_gripper().get_motors();
+-      if (!gripper_motors.empty()) {
+-        // TODO the mappings are approximates
+-        // Convert motor position (radians) to joint value (0-0.044m)
+-        double motor_pos = gripper_motors[0].get_position();
+-        pos_states_[ARM_DOF] = motor_radians_to_joint(motor_pos);
+-
+-        // Unimplemented: Velocity and torque mapping
+-        vel_states_[ARM_DOF] = 0;  // gripper_motors[0].get_velocity();
+-        tau_states_[ARM_DOF] = 0;  // gripper_motors[0].get_torque();
++      if (joint_names_.size() != ARM_DOF + 1 ||
++          pos_states_.size() != ARM_DOF + 1 || gripper_motors.size() != 1) {
++        RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                     "Malformed gripper runtime state");
++        best_effort_disable();
++        rclcpp::shutdown();
++        return hardware_interface::return_type::ERROR;
++      }
++      const double motor_position = gripper_motors.front().get_position();
++      const double motor_velocity = gripper_motors.front().get_velocity();
++      const double motor_torque = gripper_motors.front().get_torque();
++      const double raw_joint_position = motor_radians_to_joint(motor_position);
++      if (!std::isfinite(motor_position) || !std::isfinite(motor_velocity) ||
++          !std::isfinite(motor_torque) || !std::isfinite(raw_joint_position) ||
++          raw_joint_position < GRIPPER_LOWER_POSITION_LIMIT -
++                                   GRIPPER_FEEDBACK_POSITION_TOLERANCE ||
++          raw_joint_position > GRIPPER_UPPER_POSITION_LIMIT +
++                                   GRIPPER_FEEDBACK_POSITION_TOLERANCE) {
++        RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                     "Rejected non-finite or out-of-range gripper feedback");
++        best_effort_disable();
++        rclcpp::shutdown();
++        return hardware_interface::return_type::ERROR;
+       }
++      const double joint_position = std::clamp(
++          raw_joint_position, GRIPPER_LOWER_POSITION_LIMIT,
++          GRIPPER_UPPER_POSITION_LIMIT);
++      pos_states_[ARM_DOF] = joint_position;
++
++      // The upstream API does not provide a ROS-unit velocity/effort mapping.
++      vel_states_[ARM_DOF] = 0.0;
++      tau_states_[ARM_DOF] = 0.0;
+     }
+ 
+     return hardware_interface::return_type::OK;
+@@ -958,6 +1091,7 @@
+                                  ? LEFT_UPPER_POSITION_LIMITS
+                                  : RIGHT_UPPER_POSITION_LIMITS;
+   auto next_tokens = position_tokens_;
++  double next_gripper_tokens = gripper_position_tokens_;
+ 
+   for (size_t i = 0; i < ARM_DOF; ++i) {
+     if (pos_commands_[i] < lower_limits[i] ||
+@@ -997,10 +1131,62 @@
+     next_tokens[i] -= requested_step;
+   }
+ 
++  if (hand_) {
++    if (joint_names_.size() != ARM_DOF + 1 ||
++        pos_states_.size() != ARM_DOF + 1 ||
++        !std::isfinite(pos_states_[ARM_DOF]) ||
++        !std::isfinite(last_accepted_gripper_position_) ||
++        !std::isfinite(next_gripper_tokens) || next_gripper_tokens < 0.0) {
++      RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                   "Rejected malformed or non-finite gripper gate state");
++      return runtime_fault();
++    }
++    if (pos_commands_[ARM_DOF] < GRIPPER_LOWER_POSITION_LIMIT ||
++        pos_commands_[ARM_DOF] > GRIPPER_UPPER_POSITION_LIMIT ||
++        pos_states_[ARM_DOF] < GRIPPER_LOWER_POSITION_LIMIT ||
++        pos_states_[ARM_DOF] > GRIPPER_UPPER_POSITION_LIMIT) {
++      RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                   "Rejected gripper position outside the 0..0.044 m safety "
++                   "limit");
++      return runtime_fault();
++    }
++    if (vel_commands_[ARM_DOF] != 0.0 || tau_commands_[ARM_DOF] != 0.0) {
++      RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                   "Rejected non-zero gripper velocity/effort command");
++      return runtime_fault();
++    }
++    if (std::abs(pos_commands_[ARM_DOF] - pos_states_[ARM_DOF]) >
++        MAX_GRIPPER_TRACKING_ERROR) {
++      RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                   "Rejected gripper command with excessive tracking error");
++      return runtime_fault();
++    }
++
++    const double capacity =
++        MAX_GRIPPER_COMMAND_VELOCITY * POSITION_TOKEN_BURST_SECONDS;
++    next_gripper_tokens =
++        std::min(capacity,
++                 next_gripper_tokens +
++                     MAX_GRIPPER_COMMAND_VELOCITY * bounded_period);
++    const double requested_step = std::abs(
++        pos_commands_[ARM_DOF] - last_accepted_gripper_position_);
++    if (requested_step > next_gripper_tokens + 1e-12) {
++      RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                   "Rejected gripper command exceeding the 0.0147 m/s "
++                   "hardware rate gate");
++      return runtime_fault();
++    }
++    next_gripper_tokens -= requested_step;
++  }
++
+   position_tokens_ = next_tokens;
+   for (size_t i = 0; i < ARM_DOF; ++i) {
+     last_accepted_positions_[i] = pos_commands_[i];
+   }
++  if (hand_) {
++    gripper_position_tokens_ = next_gripper_tokens;
++    last_accepted_gripper_position_ = pos_commands_[ARM_DOF];
++  }
+ 
+   try {
+   // Control arm motors with MIT control

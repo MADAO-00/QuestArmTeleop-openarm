@@ -1,0 +1,237 @@
+ARG OPENARM_BASE_IMAGE=questarm-openarm-base:humble
+FROM ${OPENARM_BASE_IMAGE}
+
+ARG OPENARM_BASE_IMAGE
+ARG OPENARM_BASE_IMAGE_ID
+ARG ROS_DISTRO=humble
+ARG OPENARM_WS=/opt/openarm_ws
+ARG OPENARM_VT_PYTHON=/root/miniforge3/envs/vt/bin/python
+ARG OPENARM_PIP_INDEX_URL=https://pypi.org/simple
+
+ENV ROS_DISTRO=${ROS_DISTRO} \
+    OPENARM_WS=${OPENARM_WS} \
+    OPENARM_VT_PYTHON=${OPENARM_VT_PYTHON}
+
+LABEL org.questarm.openarm-v1.real-safety.schema="questarm-openarm-v1-real-safety-v7" \
+      org.questarm.openarm-v1.base-image-id="${OPENARM_BASE_IMAGE_ID}"
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# The runner resolves the base image's immutable ID and tags it as
+# questarm-openarm-base:build-<64 hex digits>. BuildKit cannot FROM a raw image
+# ID, so the runner verifies this local alias before and after the build.
+# Only the small deployment context is sent to this build; runtime src is mounted.
+RUN [[ "${OPENARM_BASE_IMAGE_ID}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+ && [[ "${OPENARM_BASE_IMAGE}" == "questarm-openarm-base:build-${OPENARM_BASE_IMAGE_ID#sha256:}" ]] \
+ && test "$(cat /opt/questarm/openarm-base.schema)" = "questarm-openarm-base-humble-v1"
+COPY openarm_v1.repos /tmp/openarm-v1-build/openarm_v1.repos
+COPY requirements-openarm-humble.txt /tmp/openarm-v1-build/requirements-openarm-humble.txt
+COPY scripts/ /opt/questarm/openarm-v1-safety/
+
+RUN test "$(sha256sum /opt/questarm/openarm-v1-safety/preflight_openarm_v1_ros_real.py | awk '{print $1}')" \
+      = "5d541310fee80b4af4f6d64d72a0812eeeb1f614c725d897c8facc2ca9e2c1ce" \
+ && test "$(sha256sum /opt/questarm/openarm-v1-safety/configure_openarm_v1_canfd.sh | awk '{print $1}')" \
+      = "1cd3cd66044256205f0fd080310460bb27cb32ea6e670c7cf35e9ca7d1250bb2" \
+ && test "$(sha256sum /opt/questarm/openarm-v1-safety/openarm_can_no_motion_preflight.py | awk '{print $1}')" \
+      = "f712c10adf890026960a70184635d1b3822e904435fe268984109db000dc908e" \
+ && test "$(sha256sum /opt/questarm/openarm-v1-safety/openarm_v1_overlay_fingerprint.sh | awk '{print $1}')" \
+      = "34f65c3c823e6cad8c31dc86d8d5c42abfb1b15244dd7a7a36ccf6fcf14b59a3" \
+ && test "$(sha256sum /opt/questarm/openarm-v1-safety/rebuild_openarm_v1_overlay_in_container.sh | awk '{print $1}')" \
+      = "1c855cc7a2f1d35928056e0d1bd7565e168e43324bb7f1fa911c97a6b46cb8f9" \
+ && test "$(sha256sum /opt/questarm/openarm-v1-safety/source_openarm_v1_overlay.sh | awk '{print $1}')" \
+      = "609a22a53b8a08892076f9a885edadeb55cfeb8c8efa0d1ce74bf8e240788e47" \
+ && chown -R root:root /opt/questarm/openarm-v1-safety \
+ && find /opt/questarm/openarm-v1-safety -type f -exec chmod 0444 {} + \
+ && chmod 0555 /opt/questarm/openarm-v1-safety \
+ && chmod 0555 \
+      /opt/questarm/openarm-v1-safety/preflight_openarm_v1_ros_real.py \
+      /opt/questarm/openarm-v1-safety/configure_openarm_v1_canfd.sh \
+      /opt/questarm/openarm-v1-safety/openarm_v1_overlay_fingerprint.sh \
+      /opt/questarm/openarm-v1-safety/rebuild_openarm_v1_overlay_in_container.sh \
+      /opt/questarm/openarm-v1-safety/source_openarm_v1_overlay.sh
+
+# The independent base supplies ROS/control and C++ dependencies explicitly.
+# Unrestricted rosdep would also install Gazebo, ZED and MoveIt.
+RUN mkdir -p "${OPENARM_WS}/src" \
+ && vcs import --recursive "${OPENARM_WS}/src" \
+      < /tmp/openarm-v1-build/openarm_v1.repos \
+ && test "$(git -C "${OPENARM_WS}/src/openarm_ros2" rev-parse HEAD)" \
+      = "4e837e1d0dae692ff67b560b69d8d281d7a8d4ed" \
+ && test "$(git -C "${OPENARM_WS}/src/openarm_description" rev-parse HEAD)" \
+      = "6c7b720f1ba48e8bafa3a3dc752c45f397b42221" \
+ && test "$(git -C "${OPENARM_WS}/src/openarm_can" rev-parse HEAD)" \
+      = "c32ecd31da267967f0c913c2118c843177d88b91"
+
+# These safety patches are intentionally copied after dependency cloning so
+# patch-only iterations retain the expensive apt/vcs layers. Exact upstream
+# commits above plus apply --check below make any patch drift fail closed.
+COPY patches/openarm_can-feedback-status.patch /tmp/openarm-v1-build/patches/openarm_can-feedback-status.patch
+COPY patches/openarm_can-strict-feedback.patch /tmp/openarm-v1-build/patches/openarm_can-strict-feedback.patch
+COPY patches/openarm_ros2-safe-activation.patch /tmp/openarm-v1-build/patches/openarm_ros2-safe-activation.patch
+COPY patches/openarm_ros2-feedback-deadline.patch /tmp/openarm-v1-build/patches/openarm_ros2-feedback-deadline.patch
+COPY patches/openarm_ros2-runtime-bootstrap.patch /tmp/openarm-v1-build/patches/openarm_ros2-runtime-bootstrap.patch
+COPY patches/openarm_ros2-gripper-safety.patch /tmp/openarm-v1-build/patches/openarm_ros2-gripper-safety.patch
+COPY patches/openarm_ros2-v1-velocity-limits.patch /tmp/openarm-v1-build/patches/openarm_ros2-v1-velocity-limits.patch
+COPY patches/openarm_ros2-runtime-torque-debounce.patch /tmp/openarm-v1-build/patches/openarm_ros2-runtime-torque-debounce.patch
+COPY patches/openarm_ros2-gripper-directional-velocity.patch /tmp/openarm-v1-build/patches/openarm_ros2-gripper-directional-velocity.patch
+COPY patches/openarm_ros2-runtime-gripper-velocity-policy.patch /tmp/openarm-v1-build/patches/openarm_ros2-runtime-gripper-velocity-policy.patch
+COPY patches/openarm_description-v1-hand.patch /tmp/openarm-v1-build/patches/openarm_description-v1-hand.patch
+COPY patches/verify_openarm_v1_safety_patches.sh /tmp/openarm-v1-build/patches/verify_openarm_v1_safety_patches.sh
+
+RUN test "$(sha256sum /tmp/openarm-v1-build/patches/openarm_can-feedback-status.patch | awk '{print $1}')" \
+      = "cd1dbe50559e0a59e0f0ede8af38c9e31581130ee984db8c4251cf1d1571a24f" \
+ && test "$(sha256sum /tmp/openarm-v1-build/patches/openarm_ros2-safe-activation.patch | awk '{print $1}')" \
+      = "9f1faa64b6512393852234534ce10654d321379008220b8f1349cc5a9d3b3f0d" \
+ && test "$(sha256sum /tmp/openarm-v1-build/patches/openarm_can-strict-feedback.patch | awk '{print $1}')" \
+      = "79955ac7719a0aa4ff056fc66dfd2ee01156d49be47cc563748a54e2809af0b5" \
+ && test "$(sha256sum /tmp/openarm-v1-build/patches/openarm_ros2-feedback-deadline.patch | awk '{print $1}')" \
+      = "bfe30d448952a3ba12105f7a4dccfd4eb41cb8e3b237fbaba28cfe9e79734362" \
+ && test "$(sha256sum /tmp/openarm-v1-build/patches/openarm_ros2-runtime-bootstrap.patch | awk '{print $1}')" \
+      = "eabd30c41f507a2fc4df8493a506f43090d9617d8424c1b9ce9436faee09936e" \
+ && test "$(sha256sum /tmp/openarm-v1-build/patches/openarm_ros2-gripper-safety.patch | awk '{print $1}')" \
+      = "918b93beb6c3eb4a60de0674f8b89e069bc736d80bf03d4e06c6cfc249758a62" \
+ && test "$(sha256sum /tmp/openarm-v1-build/patches/openarm_ros2-v1-velocity-limits.patch | awk '{print $1}')" \
+      = "6b0ada79e93ae0b7c337a684aacd017f02ce2fab9c22ff0c9eb616fae47caf7e" \
+ && test "$(sha256sum /tmp/openarm-v1-build/patches/openarm_ros2-runtime-torque-debounce.patch | awk '{print $1}')" \
+      = "a21a61cf9f7b3b434f61181bed5b0127a58a910e04331c0cd20222faf7df6e41" \
+ && test "$(sha256sum /tmp/openarm-v1-build/patches/openarm_ros2-gripper-directional-velocity.patch | awk '{print $1}')" \
+      = "8b082232190ff3b2b3142e8cffccd3ad71d07a4c304edb4f6d562b7972bd8fcb" \
+ && test "$(sha256sum /tmp/openarm-v1-build/patches/openarm_ros2-runtime-gripper-velocity-policy.patch | awk '{print $1}')" \
+      = "626ce881add8badffa914e34b383f6c90ab9b617600af5eeac29fb16316319be" \
+ && test "$(sha256sum /tmp/openarm-v1-build/patches/openarm_description-v1-hand.patch | awk '{print $1}')" \
+      = "68341b2f92d3c88d636489f4bba457309474be4e8e1541885e264ac203a2e928" \
+ && test "$(sha256sum /tmp/openarm-v1-build/patches/verify_openarm_v1_safety_patches.sh | awk '{print $1}')" \
+      = "6b110d24027588f0398c4fdf39e46525359c5138d5266ec6b10201cad0bcf25a" \
+ && git -C "${OPENARM_WS}/src/openarm_can" apply --check \
+      /tmp/openarm-v1-build/patches/openarm_can-feedback-status.patch \
+ && git -C "${OPENARM_WS}/src/openarm_can" apply \
+      /tmp/openarm-v1-build/patches/openarm_can-feedback-status.patch \
+ && git -C "${OPENARM_WS}/src/openarm_can" apply --check \
+      /tmp/openarm-v1-build/patches/openarm_can-strict-feedback.patch \
+ && git -C "${OPENARM_WS}/src/openarm_can" apply \
+      /tmp/openarm-v1-build/patches/openarm_can-strict-feedback.patch \
+ && git -C "${OPENARM_WS}/src/openarm_ros2" apply --check \
+      /tmp/openarm-v1-build/patches/openarm_ros2-safe-activation.patch \
+ && git -C "${OPENARM_WS}/src/openarm_ros2" apply \
+      /tmp/openarm-v1-build/patches/openarm_ros2-safe-activation.patch \
+ && git -C "${OPENARM_WS}/src/openarm_ros2" apply --check \
+      /tmp/openarm-v1-build/patches/openarm_ros2-feedback-deadline.patch \
+ && git -C "${OPENARM_WS}/src/openarm_ros2" apply \
+      /tmp/openarm-v1-build/patches/openarm_ros2-feedback-deadline.patch \
+ && git -C "${OPENARM_WS}/src/openarm_ros2" apply --check \
+      /tmp/openarm-v1-build/patches/openarm_ros2-runtime-bootstrap.patch \
+ && git -C "${OPENARM_WS}/src/openarm_ros2" apply \
+      /tmp/openarm-v1-build/patches/openarm_ros2-runtime-bootstrap.patch \
+ && git -C "${OPENARM_WS}/src/openarm_ros2" apply --check \
+      /tmp/openarm-v1-build/patches/openarm_ros2-gripper-safety.patch \
+ && git -C "${OPENARM_WS}/src/openarm_ros2" apply \
+      /tmp/openarm-v1-build/patches/openarm_ros2-gripper-safety.patch \
+ && git -C "${OPENARM_WS}/src/openarm_ros2" apply --check \
+      /tmp/openarm-v1-build/patches/openarm_ros2-v1-velocity-limits.patch \
+ && git -C "${OPENARM_WS}/src/openarm_ros2" apply \
+      /tmp/openarm-v1-build/patches/openarm_ros2-v1-velocity-limits.patch \
+ && git -C "${OPENARM_WS}/src/openarm_ros2" apply --check \
+      /tmp/openarm-v1-build/patches/openarm_ros2-runtime-torque-debounce.patch \
+ && git -C "${OPENARM_WS}/src/openarm_ros2" apply \
+      /tmp/openarm-v1-build/patches/openarm_ros2-runtime-torque-debounce.patch \
+ && git -C "${OPENARM_WS}/src/openarm_ros2" apply --check \
+      /tmp/openarm-v1-build/patches/openarm_ros2-gripper-directional-velocity.patch \
+ && git -C "${OPENARM_WS}/src/openarm_ros2" apply \
+      /tmp/openarm-v1-build/patches/openarm_ros2-gripper-directional-velocity.patch \
+ && git -C "${OPENARM_WS}/src/openarm_ros2" apply --check \
+      /tmp/openarm-v1-build/patches/openarm_ros2-runtime-gripper-velocity-policy.patch \
+ && git -C "${OPENARM_WS}/src/openarm_ros2" apply \
+      /tmp/openarm-v1-build/patches/openarm_ros2-runtime-gripper-velocity-policy.patch \
+ && git -C "${OPENARM_WS}/src/openarm_description" apply --check \
+      /tmp/openarm-v1-build/patches/openarm_description-v1-hand.patch \
+ && git -C "${OPENARM_WS}/src/openarm_description" apply \
+      /tmp/openarm-v1-build/patches/openarm_description-v1-hand.patch \
+ && bash /tmp/openarm-v1-build/patches/verify_openarm_v1_safety_patches.sh \
+      "${OPENARM_WS}/src/openarm_can" \
+      "${OPENARM_WS}/src/openarm_ros2" \
+      "${OPENARM_WS}/src/openarm_description"
+
+RUN source "/opt/ros/${ROS_DISTRO}/setup.bash" \
+ && cd "${OPENARM_WS}" \
+ && colcon build \
+      --merge-install \
+      --packages-select \
+        openarm_can \
+        openarm_description \
+        openarm_bimanual_moveit_config \
+        openarm_hardware \
+        openarm_bringup \
+      --event-handlers console_direct+ \
+      --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_TESTING=OFF \
+ && test -f "${OPENARM_WS}/install/setup.bash"
+
+RUN printf '%s\n' \
+      'questarm-openarm-v1-real-safety-v7' \
+      "base_image_id=${OPENARM_BASE_IMAGE_ID}" \
+      'openarm_can_commit=c32ecd31da267967f0c913c2118c843177d88b91' \
+      'openarm_ros2_commit=4e837e1d0dae692ff67b560b69d8d281d7a8d4ed' \
+      'openarm_description_commit=6c7b720f1ba48e8bafa3a3dc752c45f397b42221' \
+      'openarm_can_base_patch_sha256=cd1dbe50559e0a59e0f0ede8af38c9e31581130ee984db8c4251cf1d1571a24f' \
+      'openarm_can_strict_patch_sha256=79955ac7719a0aa4ff056fc66dfd2ee01156d49be47cc563748a54e2809af0b5' \
+      'openarm_ros2_base_patch_sha256=9f1faa64b6512393852234534ce10654d321379008220b8f1349cc5a9d3b3f0d' \
+      'openarm_ros2_deadline_patch_sha256=bfe30d448952a3ba12105f7a4dccfd4eb41cb8e3b237fbaba28cfe9e79734362' \
+      'openarm_ros2_runtime_bootstrap_patch_sha256=eabd30c41f507a2fc4df8493a506f43090d9617d8424c1b9ce9436faee09936e' \
+      'openarm_ros2_gripper_safety_patch_sha256=918b93beb6c3eb4a60de0674f8b89e069bc736d80bf03d4e06c6cfc249758a62' \
+      'openarm_ros2_velocity_limits_patch_sha256=6b0ada79e93ae0b7c337a684aacd017f02ce2fab9c22ff0c9eb616fae47caf7e' \
+      'openarm_ros2_runtime_torque_debounce_patch_sha256=a21a61cf9f7b3b434f61181bed5b0127a58a910e04331c0cd20222faf7df6e41' \
+      'openarm_ros2_gripper_directional_velocity_patch_sha256=8b082232190ff3b2b3142e8cffccd3ad71d07a4c304edb4f6d562b7972bd8fcb' \
+      'openarm_ros2_runtime_gripper_velocity_policy_patch_sha256=626ce881add8badffa914e34b383f6c90ab9b617600af5eeac29fb16316319be' \
+      'openarm_description_patch_sha256=68341b2f92d3c88d636489f4bba457309474be4e8e1541885e264ac203a2e928' \
+      'openarm_control_constrained_ik_patch_sha256=602ef06a63840be85a6a063202fd28da9ab3a134882259faeaac6f42b0aee93b' \
+      'openarm_control_ik_verifier_sha256=8aa467dacd8c6d2871e7cf665d378b6e8919606719fe90e3f54287ea15df5238' \
+      'safety_verifier_sha256=6b110d24027588f0398c4fdf39e46525359c5138d5266ec6b10201cad0bcf25a' \
+      'host_preflight_sha256=5d541310fee80b4af4f6d64d72a0812eeeb1f614c725d897c8facc2ca9e2c1ce' \
+      'can_config_sha256=1cd3cd66044256205f0fd080310460bb27cb32ea6e670c7cf35e9ca7d1250bb2' \
+      'motor_safety_sha256=f712c10adf890026960a70184635d1b3822e904435fe268984109db000dc908e' \
+      'overlay_fingerprint_helper_sha256=34f65c3c823e6cad8c31dc86d8d5c42abfb1b15244dd7a7a36ccf6fcf14b59a3' \
+      'overlay_rebuild_sha256=1c855cc7a2f1d35928056e0d1bd7565e168e43324bb7f1fa911c97a6b46cb8f9' \
+      'overlay_source_sha256=609a22a53b8a08892076f9a885edadeb55cfeb8c8efa0d1ce74bf8e240788e47' \
+      > "${OPENARM_WS}/.questarm-real-safety-v7" \
+ && chown root:root "${OPENARM_WS}/.questarm-real-safety-v7" \
+ && chmod 0444 "${OPENARM_WS}/.questarm-real-safety-v7"
+
+# Install into the isolated Python 3.10 venv supplied by Dockerfile.openarm-base.
+# The interpreter location is retained so runtime attestation pins the same file.
+COPY patches/openarm_control-constrained-ik.patch /tmp/openarm-v1-build/patches/openarm_control-constrained-ik.patch
+COPY patches/verify_openarm_control_constrained_ik.py /tmp/openarm-v1-build/patches/verify_openarm_control_constrained_ik.py
+
+RUN test -x "${OPENARM_VT_PYTHON}" \
+ && test "$(sha256sum /tmp/openarm-v1-build/patches/openarm_control-constrained-ik.patch | awk '{print $1}')" \
+      = "602ef06a63840be85a6a063202fd28da9ab3a134882259faeaac6f42b0aee93b" \
+ && test "$(sha256sum /tmp/openarm-v1-build/patches/verify_openarm_control_constrained_ik.py | awk '{print $1}')" \
+      = "8aa467dacd8c6d2871e7cf665d378b6e8919606719fe90e3f54287ea15df5238" \
+ && "${OPENARM_VT_PYTHON}" -m pip install --no-cache-dir \
+      --index-url "${OPENARM_PIP_INDEX_URL}" \
+      -r /tmp/openarm-v1-build/requirements-openarm-humble.txt \
+ && "${OPENARM_VT_PYTHON}" -m pip check \
+ && kinematics_path="$("${OPENARM_VT_PYTHON}" -c 'import openarm_control.kinematics as k; print(k.__file__)')" \
+ && test "$(sha256sum "${kinematics_path}" | awk '{print $1}')" \
+      = "850a6d70231d74ecf01a3d8466b37a500dc7a596b4715f8187d245b94e9d17bd" \
+ && site_packages="$(dirname "$(dirname "${kinematics_path}")")" \
+ && git -C "${site_packages}" apply --check \
+      /tmp/openarm-v1-build/patches/openarm_control-constrained-ik.patch \
+ && git -C "${site_packages}" apply \
+      /tmp/openarm-v1-build/patches/openarm_control-constrained-ik.patch \
+ && test "$(sha256sum "${kinematics_path}" | awk '{print $1}')" \
+      = "aa0ca15e2b45486c5e62093acee3b26985743834cf57b10bf6aeae6547a77d1d" \
+ && ! grep -F 'limits=[]' "${kinematics_path}" \
+ && grep -F 'Warning: constrained IK solver failed. Skipping step.' "${kinematics_path}" \
+ && "${OPENARM_VT_PYTHON}" \
+      /tmp/openarm-v1-build/patches/verify_openarm_control_constrained_ik.py \
+ && source "/opt/ros/${ROS_DISTRO}/setup.bash" \
+ && source "${OPENARM_WS}/install/setup.bash" \
+ && "${OPENARM_VT_PYTHON}" -c \
+      "import importlib.metadata as m; import rclpy; from openarm_control import Kinematics; assert m.version('openarm-control') == '0.2.0'; assert m.version('openarm-mujoco') == '2.0.1'" \
+ && rm -rf /tmp/openarm-v1-build
+
+WORKDIR /workspace
+
+# Every runner invocation starts with an explicit clean environment. Source
+# only ROS, the official OpenArm underlay and this repository's reviewed overlay.
+ENTRYPOINT []
+CMD ["/bin/bash"]

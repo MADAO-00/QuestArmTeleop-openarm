@@ -1,0 +1,332 @@
+--- a/openarm_hardware/include/openarm_hardware/openarm_simple_hardware.hpp
++++ b/openarm_hardware/include/openarm_hardware/openarm_simple_hardware.hpp
+@@ -143,9 +143,18 @@
+   double last_accepted_gripper_position_ = 0.0;
+   double gripper_position_tokens_ = 0.0;
+   bool command_gate_seeded_ = false;
++  struct RuntimeTorqueExcursionState {
++    bool pending = false;
++    bool over_limit_run = false;
++    uint64_t fresh_samples = 0;
++    std::chrono::steady_clock::time_point started_at{};
++    double peak_abs_torque = 0.0;
++  };
+   std::array<uint64_t, ARM_DOF> runtime_feedback_counts_{};
+   std::array<std::chrono::steady_clock::time_point, ARM_DOF>
+       runtime_feedback_times_{};
++  std::array<RuntimeTorqueExcursionState, ARM_DOF>
++      runtime_torque_excursions_{};
+   uint64_t runtime_gripper_feedback_count_ = 0;
+   std::chrono::steady_clock::time_point runtime_gripper_feedback_time_{};
+   bool runtime_feedback_watchdog_seeded_ = false;
+@@ -169,6 +178,7 @@
+       std::chrono::microseconds timeout,
+       const std::function<void()>& send_once,
+       bool send_disable_if_busy = false);
++  void reset_runtime_torque_excursions() noexcept;
+   bool seed_runtime_feedback_watchdog();
+   bool bootstrap_runtime_feedback();
+   bool collect_runtime_feedback();
+--- a/openarm_hardware/src/openarm_simple_hardware.cpp
++++ b/openarm_hardware/src/openarm_simple_hardware.cpp
+@@ -43,6 +43,12 @@
+ constexpr int MAX_FEEDBACK_TEMPERATURE = 70;
+ constexpr std::array<double, 7> MAX_ABS_FEEDBACK_TORQUE = {
+     40.0, 40.0, 27.0, 27.0, 7.0, 7.0, 7.0};
++constexpr double RUNTIME_TORQUE_CLEAR_FACTOR = 0.98;
++// The configured limit is already the manufacturer peak torque. Any fresh
++// sample above it is a gross-feedback fault; no additional headroom applies.
++constexpr double RUNTIME_TORQUE_HARD_FACTOR = 1.0;
++constexpr uint64_t RUNTIME_TORQUE_MIN_FRESH_SAMPLES = 3;
++constexpr auto RUNTIME_TORQUE_MIN_DURATION = std::chrono::milliseconds(20);
+ constexpr double MAX_ABS_GRIPPER_FEEDBACK_TORQUE = 7.0;
+ // Exact hard position limits from the pinned official OpenArm v1 bimanual model.
+ constexpr std::array<double, 7> LEFT_HARD_LOWER_POSITION_LIMITS = {
+@@ -497,8 +501,13 @@
+   return false;
+ }
+ 
++void OpenArmHW::reset_runtime_torque_excursions() noexcept {
++  runtime_torque_excursions_.fill(RuntimeTorqueExcursionState{});
++}
++
+ bool OpenArmHW::seed_runtime_feedback_watchdog() {
+   runtime_feedback_watchdog_seeded_ = false;
++  reset_runtime_torque_excursions();
+   const auto arm_motors = openarm_->get_arm().get_motors();
+   const auto gripper_motors =
+       hand_ ? openarm_->get_gripper().get_motors()
+@@ -523,6 +532,7 @@
+ }
+ 
+ bool OpenArmHW::bootstrap_runtime_feedback() {
++  reset_runtime_torque_excursions();
+   // ros2_control activates multiple hardware components serially, then starts
+   // its read-update-write loop. Re-establish a causal, non-motion feedback
+   // boundary on the first read so another arm's activation latency cannot age
+@@ -573,16 +583,17 @@
+   auto next_times = runtime_feedback_times_;
+   std::array<bool, ARM_DOF> fresh{};
+   std::array<double, ARM_DOF> age_ms{};
++  std::array<bool, ARM_DOF> torque_policy_ok{};
++  torque_policy_ok.fill(true);
+   bool valid = true;
++  const char* side = arm_prefix_ == "left_" ? "left" : "right";
+ 
+-  auto feedback_values_valid = [](const openarm::damiao_motor::Motor& motor,
+-                                  double max_abs_velocity,
+-                                  double max_abs_torque) {
++  auto feedback_non_torque_values_valid = [](
++      const openarm::damiao_motor::Motor& motor, double max_abs_velocity) {
+     return motor.get_status() == 1 && std::isfinite(motor.get_position()) &&
+            std::isfinite(motor.get_velocity()) &&
+            std::isfinite(motor.get_torque()) &&
+            std::abs(motor.get_velocity()) <= max_abs_velocity &&
+-           std::abs(motor.get_torque()) <= max_abs_torque &&
+            motor.get_state_tmos() >= 0 &&
+            motor.get_state_tmos() <= MAX_FEEDBACK_TEMPERATURE &&
+            motor.get_state_trotor() >= 0 &&
+@@ -597,10 +608,136 @@
+       next_times[i] = now;
+     }
+     age_ms[i] = std::chrono::duration<double, std::milli>(now - next_times[i]).count();
+-    if (!feedback_values_valid(arm_motors[i], MAX_ABS_FEEDBACK_VELOCITY[i],
+-                               MAX_ABS_FEEDBACK_TORQUE[i]) ||
+-        now - next_times[i] > RUNTIME_FEEDBACK_MAX_AGE) {
++    const bool feedback_stale =
++        now - next_times[i] > RUNTIME_FEEDBACK_MAX_AGE;
++    if (!feedback_non_torque_values_valid(
++            arm_motors[i], MAX_ABS_FEEDBACK_VELOCITY[i]) ||
++        feedback_stale) {
++      valid = false;
++      continue;
++    }
++
++    const double torque = std::abs(arm_motors[i].get_torque());
++    const double torque_limit = MAX_ABS_FEEDBACK_TORQUE[i];
++    const double torque_clear = torque_limit * RUNTIME_TORQUE_CLEAR_FACTOR;
++    const double torque_hard = torque_limit * RUNTIME_TORQUE_HARD_FACTOR;
++    auto& excursion = runtime_torque_excursions_[i];
++
++    if (torque > torque_hard) {
++      torque_policy_ok[i] = false;
+       valid = false;
++      const double elapsed_ms =
++          excursion.pending
++              ? std::chrono::duration<double, std::milli>(
++                    now - excursion.started_at)
++                    .count()
++              : 0.0;
++      RCLCPP_ERROR(
++          rclcpp::get_logger("OpenArmHW"),
++          "Runtime torque trip reason=instant_hard side=%s can=%s axis=%zu "
++          "can_id=0x%02x count=%llu fresh=%s tau=%.6f limit=%.6f "
++          "clear=%.6f hard=%.6f fresh_samples=%llu elapsed_ms=%.3f "
++          "peak=%.6f q=%.6f dq=%.6f tmos=%d trotor=%d status=%d",
++          side, can_interface_.c_str(), i + 1,
++          static_cast<unsigned int>(arm_motors[i].get_recv_can_id()),
++          static_cast<unsigned long long>(count), fresh[i] ? "yes" : "no",
++          torque, torque_limit, torque_clear, torque_hard,
++          static_cast<unsigned long long>(excursion.fresh_samples),
++          elapsed_ms, std::max(excursion.peak_abs_torque, torque),
++          arm_motors[i].get_position(), arm_motors[i].get_velocity(),
++          arm_motors[i].get_state_tmos(), arm_motors[i].get_state_trotor(),
++          arm_motors[i].get_status());
++      continue;
++    }
++
++    // A snapshot is allowed to advance this state machine only once. Repeated
++    // reads of the same decoded CAN frame cannot manufacture persistence.
++    if (!fresh[i]) {
++      continue;
++    }
++
++    if (!excursion.pending) {
++      if (torque > torque_limit) {
++        excursion.pending = true;
++        excursion.over_limit_run = true;
++        excursion.fresh_samples = 1;
++        excursion.started_at = now;
++        excursion.peak_abs_torque = torque;
++        RCLCPP_WARN(
++            rclcpp::get_logger("OpenArmHW"),
++            "Runtime torque excursion pending side=%s can=%s axis=%zu "
++            "can_id=0x%02x count=%llu tau=%.6f limit=%.6f clear=%.6f "
++            "hard=%.6f fresh_samples=1 q=%.6f dq=%.6f tmos=%d "
++            "trotor=%d status=%d",
++            side, can_interface_.c_str(), i + 1,
++            static_cast<unsigned int>(arm_motors[i].get_recv_can_id()),
++            static_cast<unsigned long long>(count), torque, torque_limit,
++            torque_clear, torque_hard, arm_motors[i].get_position(),
++            arm_motors[i].get_velocity(), arm_motors[i].get_state_tmos(),
++            arm_motors[i].get_state_trotor(), arm_motors[i].get_status());
++      }
++      continue;
++    }
++
++    excursion.peak_abs_torque =
++        std::max(excursion.peak_abs_torque, torque);
++    const double elapsed_ms = std::chrono::duration<double, std::milli>(
++                                  now - excursion.started_at)
++                                  .count();
++    if (torque <= torque_clear) {
++      RCLCPP_INFO(
++          rclcpp::get_logger("OpenArmHW"),
++          "Runtime torque excursion recovered side=%s can=%s axis=%zu "
++          "can_id=0x%02x count=%llu tau=%.6f limit=%.6f clear=%.6f "
++          "hard=%.6f fresh_samples=%llu elapsed_ms=%.3f peak=%.6f",
++          side, can_interface_.c_str(), i + 1,
++          static_cast<unsigned int>(arm_motors[i].get_recv_can_id()),
++          static_cast<unsigned long long>(count), torque, torque_limit,
++          torque_clear, torque_hard,
++          static_cast<unsigned long long>(excursion.fresh_samples),
++          elapsed_ms, excursion.peak_abs_torque);
++      excursion = RuntimeTorqueExcursionState{};
++      continue;
++    }
++
++    // The 98% threshold is diagnostic hysteresis only. A fresh sample at or
++    // below the original application limit ends the continuous over-limit run,
++    // so one quantized spike cannot mature into a delayed trip while the arm
++    // remains in the C..L warning band.
++    if (torque <= torque_limit) {
++      excursion.over_limit_run = false;
++      excursion.fresh_samples = 0;
++      continue;
++    }
++    if (!excursion.over_limit_run) {
++      excursion.over_limit_run = true;
++      excursion.fresh_samples = 1;
++      excursion.started_at = now;
++      continue;
++    }
++
++    ++excursion.fresh_samples;
++    const bool minimum_persistence_reached =
++        excursion.fresh_samples >= RUNTIME_TORQUE_MIN_FRESH_SAMPLES &&
++        now - excursion.started_at >= RUNTIME_TORQUE_MIN_DURATION;
++    if (minimum_persistence_reached) {
++      torque_policy_ok[i] = false;
++      valid = false;
++      RCLCPP_ERROR(
++          rclcpp::get_logger("OpenArmHW"),
++          "Runtime torque trip reason=persistent side=%s can=%s axis=%zu "
++          "can_id=0x%02x count=%llu fresh=yes tau=%.6f limit=%.6f "
++          "clear=%.6f hard=%.6f fresh_samples=%llu elapsed_ms=%.3f "
++          "peak=%.6f q=%.6f dq=%.6f tmos=%d trotor=%d status=%d",
++          side, can_interface_.c_str(), i + 1,
++          static_cast<unsigned int>(arm_motors[i].get_recv_can_id()),
++          static_cast<unsigned long long>(count), torque, torque_limit,
++          torque_clear, torque_hard,
++          static_cast<unsigned long long>(excursion.fresh_samples),
++          elapsed_ms, excursion.peak_abs_torque,
++          arm_motors[i].get_position(), arm_motors[i].get_velocity(),
++          arm_motors[i].get_state_tmos(), arm_motors[i].get_state_trotor(),
++          arm_motors[i].get_status());
+     }
+   }
+ 
+@@ -617,9 +754,10 @@
+     }
+     gripper_age_ms =
+         std::chrono::duration<double, std::milli>(now - next_gripper_time).count();
+-    if (!feedback_values_valid(gripper_motors.front(),
+-                               MAX_ABS_GRIPPER_FEEDBACK_VELOCITY,
+-                               MAX_ABS_GRIPPER_FEEDBACK_TORQUE) ||
++    if (!feedback_non_torque_values_valid(
++            gripper_motors.front(), MAX_ABS_GRIPPER_FEEDBACK_VELOCITY) ||
++        std::abs(gripper_motors.front().get_torque()) >
++            MAX_ABS_GRIPPER_FEEDBACK_TORQUE ||
+         now - next_gripper_time > RUNTIME_FEEDBACK_MAX_AGE) {
+       valid = false;
+     }
+@@ -636,8 +774,9 @@
+   }
+ 
+   RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
+-               "Runtime feedback validation failed; inspect per-axis "
++               "Runtime feedback validation failed side=%s can=%s; inspect per-axis "
+                "predicates below (max age %.3f ms)",
++               side, can_interface_.c_str(),
+                std::chrono::duration<double, std::milli>(
+                    RUNTIME_FEEDBACK_MAX_AGE)
+                    .count());
+@@ -646,7 +785,9 @@
+                                uint64_t previous_count, bool is_fresh,
+                                double feedback_age_ms,
+                                double max_abs_velocity,
+-                               double max_abs_torque) {
++                               double max_abs_torque,
++                               bool torque_gate_ok,
++                               bool torque_pending) {
+     const bool counter_changed =
+         motor.state_update_count() != previous_count;
+     const bool finite = std::isfinite(motor.get_position()) &&
+@@ -662,18 +803,21 @@
+         motor.get_state_trotor() <= MAX_FEEDBACK_TEMPERATURE;
+     RCLCPP_ERROR(
+         rclcpp::get_logger("OpenArmHW"),
+-        "runtime %s axis=%zu can_id=0x%02x count=%llu->%llu changed=%s "
++        "runtime side=%s can=%s %s axis=%zu can_id=0x%02x "
++        "count=%llu->%llu changed=%s "
+         "fresh=%s age_ms=%.3f raw_status=%d expected=1 finite=%s "
+-        "velocity_ok=%s velocity_limit=%.6f torque_ok=%s temperature_ok=%s "
+-        "q=%.6f dq=%.6f "
++        "velocity_ok=%s velocity_limit=%.6f torque_limit_ok=%s "
++        "torque_gate_ok=%s torque_pending=%s temperature_ok=%s q=%.6f dq=%.6f "
+         "tau=%.6f tmos=%d trotor=%d",
+-        component, axis, static_cast<unsigned int>(motor.get_recv_can_id()),
++        side, can_interface_.c_str(), component, axis,
++        static_cast<unsigned int>(motor.get_recv_can_id()),
+         static_cast<unsigned long long>(previous_count),
+         static_cast<unsigned long long>(motor.state_update_count()),
+         counter_changed ? "yes" : "no", is_fresh ? "yes" : "no",
+         feedback_age_ms, motor.get_status(), finite ? "yes" : "no",
+         velocity_ok ? "yes" : "no", max_abs_velocity,
+-        torque_ok ? "yes" : "no",
++        torque_ok ? "yes" : "no", torque_gate_ok ? "yes" : "no",
++        torque_pending ? "yes" : "no",
+         temperature_ok ? "yes" : "no", motor.get_position(),
+         motor.get_velocity(), motor.get_torque(), motor.get_state_tmos(),
+         motor.get_state_trotor());
+@@ -682,13 +826,14 @@
+     log_runtime_motor("arm", i + 1, arm_motors[i],
+                       runtime_feedback_counts_[i], fresh[i], age_ms[i],
+                       MAX_ABS_FEEDBACK_VELOCITY[i],
+-                      MAX_ABS_FEEDBACK_TORQUE[i]);
++                      MAX_ABS_FEEDBACK_TORQUE[i], torque_policy_ok[i],
++                      runtime_torque_excursions_[i].pending);
+   }
+   if (hand_) {
+     log_runtime_motor("gripper", 1, gripper_motors.front(),
+                       runtime_gripper_feedback_count_, gripper_fresh,
+                       gripper_age_ms, MAX_ABS_GRIPPER_FEEDBACK_VELOCITY,
+-                      MAX_ABS_GRIPPER_FEEDBACK_TORQUE);
++                      MAX_ABS_GRIPPER_FEEDBACK_TORQUE, true, false);
+   }
+   return false;
+ }
+@@ -821,6 +966,7 @@
+ bool OpenArmHW::best_effort_disable() noexcept {
+   runtime_feedback_watchdog_seeded_ = false;
+   runtime_feedback_bootstrap_pending_ = false;
++  reset_runtime_torque_excursions();
+   for (int attempt = 1; attempt <= BEST_EFFORT_DISABLE_ATTEMPTS; ++attempt) {
+     try {
+       openarm_->set_callback_mode_all(
+@@ -863,6 +1009,7 @@
+     openarm_->set_callback_mode_all(openarm::damiao_motor::CallbackMode::STATE);
+     runtime_feedback_watchdog_seeded_ = false;
+     runtime_feedback_bootstrap_pending_ = false;
++    reset_runtime_torque_excursions();
+ 
+     // Disable is the only activation command that may be retried. Every retry
+     // is an independent causal transaction with a new quiet drain and counter
+@@ -967,6 +1114,7 @@
+   RCLCPP_INFO(rclcpp::get_logger("OpenArmHW"), "Deactivating OpenArm V10...");
+   runtime_feedback_watchdog_seeded_ = false;
+   runtime_feedback_bootstrap_pending_ = false;
++  reset_runtime_torque_excursions();
+ 
+   if (!best_effort_disable()) {
+     RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),

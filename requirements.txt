@@ -1,0 +1,7 @@
+# Python 3.10 baseline for the independent OpenArm ROS 2 Humble environment.
+# ROS packages and C++ hardware drivers are installed by the Dockerfiles.
+# Versions matched to the existing OpenArm IK runtime; no Pinocchio/CasADi required.
+numpy==2.2.6
+scipy==1.15.2
+PyYAML==6.0.3
+pure-python-adb==0.3.0.dev0

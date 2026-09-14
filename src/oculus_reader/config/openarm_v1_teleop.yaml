@@ -1,0 +1,257 @@
+# OpenArm v1 adapter configuration for QuestArmTeleop.
+#
+# Real hardware requires the host runner's preflight gate. The zero home poses
+# below are simulation defaults; HOME stays disabled in real mode.
+
+pub_pose_openarm_v1_node:
+  ros__parameters:
+    publish_rate_hz: 100.0
+    parent_frame_id: arm_origin
+    button_state_topic: /oculus/buttons
+    source_valid_topic: /oculus/source_valid
+    source_epoch_topic: /oculus/source_epoch
+    left_handle_pose_topic: /left_handle_pose
+    right_handle_pose_topic: /right_handle_pose
+    source_timeout_sec: 0.30
+    grip_press_threshold: 0.55
+    grip_release_threshold: 0.35
+
+left_pub_delta_pose_openarm_v1:
+  ros__parameters:
+    side: left
+    handle_pose_topic: /left_handle_pose
+    feedback_tcp_pose_topic: /left_arm/feedback/tcp_pose
+    feedback_joint_topic: /joint_states
+    button_state_topic: /oculus/buttons
+    source_valid_topic: /oculus/source_valid
+    # PoseStamped is debug/RViz only; IK consumes the atomic target intent.
+    target_pose_topic: /openarm/target_pose/left
+    target_intent_topic: /openarm/target_intent/left
+    mode_topic: /openarm/mode/left
+    gripper_intent_topic: /openarm/gripper_intent/left
+    target_frame_id: arm_origin
+    hold_button: LG
+    home_button: LJ
+    trigger_axis: leftTrig
+    grip_axis: leftGrip
+    grip_press_threshold: 0.55
+    grip_release_threshold: 0.35
+    trigger_release_threshold: 0.02
+    joint_names:
+      - openarm_left_joint1
+      - openarm_left_joint2
+      - openarm_left_joint3
+      - openarm_left_joint4
+      - openarm_left_joint5
+      - openarm_left_joint6
+      - openarm_left_joint7
+    home_joint_positions: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    control_rate_hz: 50.0
+    input_timeout_sec: 0.30
+    feedback_timeout_sec: 0.30
+    fault_rearm_release_sec: 0.50
+    home_tolerance_rad: 0.03
+    enable_home: true
+
+right_pub_delta_pose_openarm_v1:
+  ros__parameters:
+    side: right
+    handle_pose_topic: /right_handle_pose
+    feedback_tcp_pose_topic: /right_arm/feedback/tcp_pose
+    feedback_joint_topic: /joint_states
+    button_state_topic: /oculus/buttons
+    source_valid_topic: /oculus/source_valid
+    # PoseStamped is debug/RViz only; IK consumes the atomic target intent.
+    target_pose_topic: /openarm/target_pose/right
+    target_intent_topic: /openarm/target_intent/right
+    mode_topic: /openarm/mode/right
+    gripper_intent_topic: /openarm/gripper_intent/right
+    target_frame_id: arm_origin
+    hold_button: RG
+    home_button: RJ
+    trigger_axis: rightTrig
+    grip_axis: rightGrip
+    grip_press_threshold: 0.55
+    grip_release_threshold: 0.35
+    trigger_release_threshold: 0.02
+    joint_names:
+      - openarm_right_joint1
+      - openarm_right_joint2
+      - openarm_right_joint3
+      - openarm_right_joint4
+      - openarm_right_joint5
+      - openarm_right_joint6
+      - openarm_right_joint7
+    home_joint_positions: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    control_rate_hz: 50.0
+    input_timeout_sec: 0.30
+    feedback_timeout_sec: 0.30
+    fault_rearm_release_sec: 0.50
+    home_tolerance_rad: 0.03
+    enable_home: true
+
+openarm_bimanual_ik:
+  ros__parameters:
+    # Empty resolves the pinned model installed in the oculus_reader share.
+    model_xml: ''
+    origin_frame: arm_origin
+    frame_right: openarm_right_hand_tcp
+    frame_left: openarm_left_hand_tcp
+    keyframe: ''
+    # Retained debug streams; they are not part of the IK command contract.
+    right_target_pose_topic: /openarm/target_pose/right
+    left_target_pose_topic: /openarm/target_pose/left
+    # Control targets atomically bind pose, Quest source epoch, and intent token.
+    right_target_intent_topic: /openarm/target_intent/right
+    left_target_intent_topic: /openarm/target_intent/left
+    left_mode_topic: /openarm/mode/left
+    right_mode_topic: /openarm/mode/right
+    right_ik_topic: /openarm/ik/right
+    left_ik_topic: /openarm/ik/left
+    right_guard_acceptance_topic: /openarm/guard_acceptance/right
+    left_guard_acceptance_topic: /openarm/guard_acceptance/left
+    right_guard_anchor_topic: /openarm/guard_anchor/right
+    left_guard_anchor_topic: /openarm/guard_anchor/left
+    right_sync_wait_topic: /openarm/ik_sync_wait/right
+    left_sync_wait_topic: /openarm/ik_sync_wait/left
+    right_tcp_pose_topic: /right_arm/feedback/tcp_pose
+    left_tcp_pose_topic: /left_arm/feedback/tcp_pose
+    joint_state_topic: /joint_states
+    right_joint_names:
+      - openarm_right_joint1
+      - openarm_right_joint2
+      - openarm_right_joint3
+      - openarm_right_joint4
+      - openarm_right_joint5
+      - openarm_right_joint6
+      - openarm_right_joint7
+    left_joint_names:
+      - openarm_left_joint1
+      - openarm_left_joint2
+      - openarm_left_joint3
+      - openarm_left_joint4
+      - openarm_left_joint5
+      - openarm_left_joint6
+      - openarm_left_joint7
+    right_gripper_joint_name: openarm_right_finger_joint1
+    left_gripper_joint_name: openarm_left_finger_joint1
+    right_gripper_hold: 0.0
+    left_gripper_hold: 0.0
+    solve_rate_hz: 100.0
+    feedback_timeout_sec: 0.30
+    target_timeout_sec: 0.30
+    mode_timeout_sec: 0.30
+    guard_ack_timeout_sec: 0.25
+    guard_anchor_timeout_sec: 0.30
+    bimanual_target_max_skew_sec: 0.03
+    position_cost: 1.0
+    orientation_cost: 1.0
+    dt: 0.02
+    max_iters: 10
+    damping: 0.10
+    posture_cost: 0.01
+    lm_damping: 0.01
+    solver: daqp
+    # 90% of openarm-control==0.2.0's official per-joint IK caps.
+    right_max_velocity_rad_s: [1.413, 1.413, 2.826, 2.826, 11.34, 11.34, 11.34]
+    left_max_velocity_rad_s: [1.413, 1.413, 2.826, 2.826, 11.34, 11.34, 11.34]
+    # Must match the guard's final command-to-feedback envelope so a fresh
+    # controller anchor cannot be accepted as a solver base outside that gate.
+    max_tracking_error_rad: [0.12, 0.12, 0.12, 0.12, 0.24, 0.24, 0.24]
+    # IK-only soft work area: exactly 95% of each pinned official bimanual
+    # MJCF/URDF hard endpoint, scaled toward the common q0=0 reference.
+    # Serialized values are rounded inward so the YAML never exceeds 95%.
+    left_lower_limits: [-3.316126050, -3.150319060, -1.492256200, 0.0, -1.492256200, -0.746128100, -1.492256200]
+    left_upper_limits: [1.326449849, 0.165806039, 1.492256200, 2.321287950, 1.492256200, 0.746128100, 1.492256200]
+    right_lower_limits: [-1.326449850, -0.165806039, -1.492256200, 0.0, -1.492256200, -0.746128100, -1.492256200]
+    right_upper_limits: [3.316126050, 3.150319060, 1.492256200, 2.321287950, 1.492256200, 0.746128100, 1.492256200]
+
+openarm_command_guard:
+  ros__parameters:
+    control_rate_hz: 100.0
+    joint_state_topic: /joint_states
+    left_ik_topic: /openarm/ik/left
+    right_ik_topic: /openarm/ik/right
+    left_mode_topic: /openarm/mode/left
+    right_mode_topic: /openarm/mode/right
+    left_command_topic: /left_forward_position_controller/commands
+    right_command_topic: /right_forward_position_controller/commands
+    left_gripper_intent_topic: /openarm/gripper_intent/left
+    right_gripper_intent_topic: /openarm/gripper_intent/right
+    left_gripper_command_topic: /left_gripper_forward_position_controller/commands
+    right_gripper_command_topic: /right_gripper_forward_position_controller/commands
+    left_gripper_joint_name: openarm_left_finger_joint1
+    right_gripper_joint_name: openarm_right_finger_joint1
+    left_guard_mode_topic: /openarm/guard_mode/left
+    right_guard_mode_topic: /openarm/guard_mode/right
+    left_guard_acceptance_topic: /openarm/guard_acceptance/left
+    right_guard_acceptance_topic: /openarm/guard_acceptance/right
+    left_guard_anchor_topic: /openarm/guard_anchor/left
+    right_guard_anchor_topic: /openarm/guard_anchor/right
+    left_sync_wait_topic: /openarm/ik_sync_wait/left
+    right_sync_wait_topic: /openarm/ik_sync_wait/right
+    left_joint_names:
+      - openarm_left_joint1
+      - openarm_left_joint2
+      - openarm_left_joint3
+      - openarm_left_joint4
+      - openarm_left_joint5
+      - openarm_left_joint6
+      - openarm_left_joint7
+    right_joint_names:
+      - openarm_right_joint1
+      - openarm_right_joint2
+      - openarm_right_joint3
+      - openarm_right_joint4
+      - openarm_right_joint5
+      - openarm_right_joint6
+      - openarm_right_joint7
+    right_home_positions: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    left_home_positions: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    # Final command/feedback boundary: exact official bimanual MJCF/URDF hard
+    # limits. The 95% IK work area above is deliberately not a FAULT boundary.
+    left_lower_limits: [-3.490659, -3.3161253267948965, -1.570796, 0.0, -1.570796, -0.785398, -1.570796]
+    left_upper_limits: [1.3962629999999998, 0.17453267320510335, 1.570796, 2.443461, 1.570796, 0.785398, 1.570796]
+    right_lower_limits: [-1.396263, -0.17453267320510335, -1.570796, 0.0, -1.570796, -0.785398, -1.570796]
+    right_upper_limits: [3.490659, 3.3161253267948965, 1.570796, 2.443461, 1.570796, 0.785398, 1.570796]
+    right_max_velocity_rad_s: [1.413, 1.413, 2.826, 2.826, 11.34, 11.34, 11.34]
+    left_max_velocity_rad_s: [1.413, 1.413, 2.826, 2.826, 11.34, 11.34, 11.34]
+    feedback_timeout_sec: 0.30
+    ik_timeout_sec: 0.30
+    # A live IK node may briefly HOLD an established side while a newly
+    # engaged peer's anchor/Quest epoch crosses asynchronous ROS topics. This
+    # bounded exception never carries an arm command and cannot extend forever.
+    sync_wait_max_sec: 0.75
+    # A Grip edge must result in its first validated IK command actually being
+    # submitted inside this inclusive deadline. Timeout latches FAULT and a
+    # late IK sample cannot recover without release/re-arm.
+    teleop_arming_timeout_sec: 0.75
+    mode_timeout_sec: 0.30
+    # J1-J4 retain 0.12 rad; J5-J7 need 0.24 rad to contain two complete
+    # 100 Hz command steps at the official-control 90% wrist limit.
+    max_tracking_error_rad: [0.12, 0.12, 0.12, 0.12, 0.24, 0.24, 0.24]
+    gripper_lower_limit_m: 0.0
+    gripper_upper_limit_m: 0.044
+    # The official ROS 0..0.044 m range remains the hard envelope. This
+    # robot's commissioned runtime-open target is 0.040 m.
+    gripper_open_position_m: 0.040
+    gripper_open_velocity_m_s: 0.5000
+    gripper_close_velocity_m_s: 0.5000
+    gripper_max_tracking_error_m: 0.00504
+    # On a direction reversal, first rate-limit the command back to feedback,
+    # then require three new 100 Hz samples inside the derived 40 um reserve.
+    # Their 30 ms window is longer than the hardware's 20 ms feedback stale gate.
+    gripper_reversal_settle_samples: 3
+    # Match the hardware feedback-position tolerance. Per-sample and cumulative
+    # old-direction drift above this value resets the complete settle window.
+    gripper_reversal_feedback_motion_tolerance_m: 0.00002
+    gripper_intent_timeout_sec: 0.30
+    gripper_rearm_open_intent_min: 0.98
+    # The right mechanism repeatedly plateaus near 35.7 mm at the unchanged
+    # 40 mm command. Its 4.5 mm acceptance gap remains below the 5.04 mm gate.
+    right_gripper_rearm_open_tolerance_m: 0.0045
+    left_gripper_rearm_open_tolerance_m: 0.0025
+    gripper_rearm_open_settle_sec: 0.25
+    gripper_rearm_open_timeout_sec: 5.0
+    fault_rearm_hold_sec: 0.50
+    home_tolerance_rad: 0.03

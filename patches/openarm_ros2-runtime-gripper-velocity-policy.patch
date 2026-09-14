@@ -1,0 +1,318 @@
+diff --git a/openarm_hardware/include/openarm_hardware/openarm_simple_hardware.hpp b/openarm_hardware/include/openarm_hardware/openarm_simple_hardware.hpp
+index f209f79..4689b8a 100644
+--- a/openarm_hardware/include/openarm_hardware/openarm_simple_hardware.hpp
++++ b/openarm_hardware/include/openarm_hardware/openarm_simple_hardware.hpp
+@@ -150,6 +150,12 @@ class OpenArmHW : public hardware_interface::SystemInterface {
+     std::chrono::steady_clock::time_point started_at{};
+     double peak_abs_torque = 0.0;
+   };
++  struct RuntimeGripperVelocityExcursionState {
++    bool over_limit_run = false;
++    uint64_t fresh_samples = 0;
++    std::chrono::steady_clock::time_point started_at{};
++    double peak_abs_velocity = 0.0;
++  };
+   std::array<uint64_t, ARM_DOF> runtime_feedback_counts_{};
+   std::array<std::chrono::steady_clock::time_point, ARM_DOF>
+       runtime_feedback_times_{};
+@@ -157,6 +163,8 @@ class OpenArmHW : public hardware_interface::SystemInterface {
+       runtime_torque_excursions_{};
+   uint64_t runtime_gripper_feedback_count_ = 0;
+   std::chrono::steady_clock::time_point runtime_gripper_feedback_time_{};
++  RuntimeGripperVelocityExcursionState
++      runtime_gripper_velocity_excursion_{};
+   bool runtime_feedback_watchdog_seeded_ = false;
+   bool runtime_feedback_bootstrap_pending_ = false;
+ 
+@@ -179,6 +187,7 @@ class OpenArmHW : public hardware_interface::SystemInterface {
+       const std::function<void()>& send_once,
+       bool send_disable_if_busy = false);
+   void reset_runtime_torque_excursions() noexcept;
++  void reset_runtime_gripper_velocity_excursion() noexcept;
+   bool seed_runtime_feedback_watchdog();
+   bool bootstrap_runtime_feedback();
+   bool collect_runtime_feedback();
+diff --git a/openarm_hardware/src/openarm_simple_hardware.cpp b/openarm_hardware/src/openarm_simple_hardware.cpp
+index d616502..4f84556 100644
+--- a/openarm_hardware/src/openarm_simple_hardware.cpp
++++ b/openarm_hardware/src/openarm_simple_hardware.cpp
+@@ -67,6 +67,10 @@ constexpr double POSITION_TOKEN_BURST_SECONDS = 0.020;
+ constexpr std::array<double, 7> MAX_TRACKING_ERROR = {
+     0.12, 0.12, 0.12, 0.12, 0.24, 0.24, 0.24};
+ constexpr double MAX_ABS_GRIPPER_FEEDBACK_VELOCITY = 18.849555921;
++constexpr double RUNTIME_GRIPPER_VELOCITY_HARD_LIMIT = 18.849555921;
++constexpr uint64_t RUNTIME_GRIPPER_VELOCITY_MIN_FRESH_SAMPLES = 3;
++constexpr auto RUNTIME_GRIPPER_VELOCITY_MIN_DURATION =
++    std::chrono::milliseconds(20);
+ constexpr double GRIPPER_LOWER_POSITION_LIMIT = 0.0;
+ constexpr double GRIPPER_UPPER_POSITION_LIMIT = 0.044;
+ constexpr double GRIPPER_FEEDBACK_POSITION_TOLERANCE = 0.00002;
+@@ -506,9 +510,15 @@ void OpenArmHW::reset_runtime_torque_excursions() noexcept {
+   runtime_torque_excursions_.fill(RuntimeTorqueExcursionState{});
+ }
+ 
++void OpenArmHW::reset_runtime_gripper_velocity_excursion() noexcept {
++  runtime_gripper_velocity_excursion_ =
++      RuntimeGripperVelocityExcursionState{};
++}
++
+ bool OpenArmHW::seed_runtime_feedback_watchdog() {
+   runtime_feedback_watchdog_seeded_ = false;
+   reset_runtime_torque_excursions();
++  reset_runtime_gripper_velocity_excursion();
+   const auto arm_motors = openarm_->get_arm().get_motors();
+   const auto gripper_motors =
+       hand_ ? openarm_->get_gripper().get_motors()
+@@ -534,6 +544,7 @@ bool OpenArmHW::seed_runtime_feedback_watchdog() {
+ 
+ bool OpenArmHW::bootstrap_runtime_feedback() {
+   reset_runtime_torque_excursions();
++  reset_runtime_gripper_velocity_excursion();
+   // ros2_control activates multiple hardware components serially, then starts
+   // its read-update-write loop. Re-establish a causal, non-motion feedback
+   // boundary on the first read so another arm's activation latency cannot age
+@@ -600,6 +611,16 @@ bool OpenArmHW::collect_runtime_feedback() {
+            motor.get_state_trotor() >= 0 &&
+            motor.get_state_trotor() <= MAX_FEEDBACK_TEMPERATURE;
+   };
++  auto feedback_values_except_velocity_valid = [](
++      const openarm::damiao_motor::Motor& motor) {
++    return motor.get_status() == 1 && std::isfinite(motor.get_position()) &&
++           std::isfinite(motor.get_velocity()) &&
++           std::isfinite(motor.get_torque()) &&
++           motor.get_state_tmos() >= 0 &&
++           motor.get_state_tmos() <= MAX_FEEDBACK_TEMPERATURE &&
++           motor.get_state_trotor() >= 0 &&
++           motor.get_state_trotor() <= MAX_FEEDBACK_TEMPERATURE;
++  };
+ 
+   for (size_t i = 0; i < ARM_DOF; ++i) {
+     const auto count = arm_motors[i].state_update_count();
+@@ -744,6 +765,7 @@ bool OpenArmHW::collect_runtime_feedback() {
+ 
+   bool gripper_fresh = false;
+   double gripper_age_ms = 0.0;
++  bool gripper_velocity_policy_ok = true;
+   uint64_t next_gripper_count = runtime_gripper_feedback_count_;
+   auto next_gripper_time = runtime_gripper_feedback_time_;
+   if (hand_) {
+@@ -755,12 +777,122 @@ bool OpenArmHW::collect_runtime_feedback() {
+     }
+     gripper_age_ms =
+         std::chrono::duration<double, std::milli>(now - next_gripper_time).count();
+-    if (!feedback_non_torque_values_valid(
+-            gripper_motors.front(), MAX_ABS_GRIPPER_FEEDBACK_VELOCITY) ||
+-        std::abs(gripper_motors.front().get_torque()) >
+-            MAX_ABS_GRIPPER_FEEDBACK_TORQUE ||
+-        now - next_gripper_time > RUNTIME_FEEDBACK_MAX_AGE) {
++    const auto& gripper = gripper_motors.front();
++    const double velocity = std::abs(gripper.get_velocity());
++    const bool feedback_stale =
++        now - next_gripper_time > RUNTIME_FEEDBACK_MAX_AGE;
++    if (!feedback_values_except_velocity_valid(gripper) ||
++        std::abs(gripper.get_torque()) > MAX_ABS_GRIPPER_FEEDBACK_TORQUE ||
++        feedback_stale) {
+       valid = false;
++    } else {
++      auto& excursion = runtime_gripper_velocity_excursion_;
++      if (velocity > RUNTIME_GRIPPER_VELOCITY_HARD_LIMIT) {
++        gripper_velocity_policy_ok = false;
++        valid = false;
++        const double elapsed_ms =
++            excursion.over_limit_run
++                ? std::chrono::duration<double, std::milli>(
++                      now - excursion.started_at)
++                      .count()
++                : 0.0;
++        RCLCPP_ERROR(
++            rclcpp::get_logger("OpenArmHW"),
++            "Runtime gripper velocity trip reason=instant_hard side=%s "
++            "can=%s can_id=0x%02x count=%llu fresh=%s dq=%.6f "
++            "abs_dq=%.6f limit=%.6f hard=%.6f fresh_samples=%llu "
++            "elapsed_ms=%.3f peak=%.6f q=%.6f tau=%.6f tmos=%d "
++            "trotor=%d status=%d",
++            side, can_interface_.c_str(),
++            static_cast<unsigned int>(gripper.get_recv_can_id()),
++            static_cast<unsigned long long>(count),
++            gripper_fresh ? "yes" : "no", gripper.get_velocity(), velocity,
++            MAX_ABS_GRIPPER_FEEDBACK_VELOCITY,
++            RUNTIME_GRIPPER_VELOCITY_HARD_LIMIT,
++            static_cast<unsigned long long>(excursion.fresh_samples),
++            elapsed_ms, std::max(excursion.peak_abs_velocity, velocity),
++            gripper.get_position(), gripper.get_torque(),
++            gripper.get_state_tmos(), gripper.get_state_trotor(),
++            gripper.get_status());
++      } else if (gripper_fresh) {
++        if (velocity <= MAX_ABS_GRIPPER_FEEDBACK_VELOCITY) {
++          if (excursion.over_limit_run) {
++            const double elapsed_ms =
++                std::chrono::duration<double, std::milli>(
++                    now - excursion.started_at)
++                    .count();
++            RCLCPP_INFO(
++                rclcpp::get_logger("OpenArmHW"),
++                "Runtime gripper velocity excursion recovered side=%s "
++                "can=%s can_id=0x%02x count=%llu dq=%.6f abs_dq=%.6f "
++                "limit=%.6f hard=%.6f fresh_samples=%llu "
++                "elapsed_ms=%.3f peak=%.6f",
++                side, can_interface_.c_str(),
++                static_cast<unsigned int>(gripper.get_recv_can_id()),
++                static_cast<unsigned long long>(count),
++                gripper.get_velocity(), velocity,
++                MAX_ABS_GRIPPER_FEEDBACK_VELOCITY,
++                RUNTIME_GRIPPER_VELOCITY_HARD_LIMIT,
++                static_cast<unsigned long long>(excursion.fresh_samples),
++                elapsed_ms, excursion.peak_abs_velocity);
++          }
++          excursion = RuntimeGripperVelocityExcursionState{};
++        } else if (!excursion.over_limit_run) {
++          excursion.over_limit_run = true;
++          excursion.fresh_samples = 1;
++          excursion.started_at = now;
++          excursion.peak_abs_velocity = velocity;
++          RCLCPP_WARN(
++              rclcpp::get_logger("OpenArmHW"),
++              "Runtime gripper velocity excursion pending side=%s can=%s "
++              "can_id=0x%02x count=%llu fresh=yes dq=%.6f abs_dq=%.6f "
++              "limit=%.6f hard=%.6f fresh_samples=1 q=%.6f tau=%.6f "
++              "tmos=%d trotor=%d status=%d",
++              side, can_interface_.c_str(),
++              static_cast<unsigned int>(gripper.get_recv_can_id()),
++              static_cast<unsigned long long>(count), gripper.get_velocity(),
++              velocity, MAX_ABS_GRIPPER_FEEDBACK_VELOCITY,
++              RUNTIME_GRIPPER_VELOCITY_HARD_LIMIT,
++              gripper.get_position(), gripper.get_torque(),
++              gripper.get_state_tmos(), gripper.get_state_trotor(),
++              gripper.get_status());
++        } else {
++          ++excursion.fresh_samples;
++          excursion.peak_abs_velocity =
++              std::max(excursion.peak_abs_velocity, velocity);
++          const double elapsed_ms =
++              std::chrono::duration<double, std::milli>(
++                  now - excursion.started_at)
++                  .count();
++          const bool minimum_persistence_reached =
++              excursion.fresh_samples >=
++                  RUNTIME_GRIPPER_VELOCITY_MIN_FRESH_SAMPLES &&
++              now - excursion.started_at >=
++                  RUNTIME_GRIPPER_VELOCITY_MIN_DURATION;
++          if (minimum_persistence_reached) {
++            gripper_velocity_policy_ok = false;
++            valid = false;
++            RCLCPP_ERROR(
++                rclcpp::get_logger("OpenArmHW"),
++                "Runtime gripper velocity trip reason=persistent side=%s "
++                "can=%s can_id=0x%02x count=%llu fresh=yes dq=%.6f "
++                "abs_dq=%.6f limit=%.6f hard=%.6f fresh_samples=%llu "
++                "elapsed_ms=%.3f peak=%.6f q=%.6f tau=%.6f tmos=%d "
++                "trotor=%d status=%d",
++                side, can_interface_.c_str(),
++                static_cast<unsigned int>(gripper.get_recv_can_id()),
++                static_cast<unsigned long long>(count),
++                gripper.get_velocity(), velocity,
++                MAX_ABS_GRIPPER_FEEDBACK_VELOCITY,
++                RUNTIME_GRIPPER_VELOCITY_HARD_LIMIT,
++                static_cast<unsigned long long>(excursion.fresh_samples),
++                elapsed_ms, excursion.peak_abs_velocity,
++                gripper.get_position(), gripper.get_torque(),
++                gripper.get_state_tmos(), gripper.get_state_trotor(),
++                gripper.get_status());
++          }
++        }
++      }
+     }
+   }
+ 
+@@ -787,6 +919,8 @@ bool OpenArmHW::collect_runtime_feedback() {
+                                double feedback_age_ms,
+                                double max_abs_velocity,
+                                double max_abs_torque,
++                               bool velocity_gate_ok,
++                               bool velocity_pending,
+                                bool torque_gate_ok,
+                                bool torque_pending) {
+     const bool counter_changed =
+@@ -794,7 +928,7 @@ bool OpenArmHW::collect_runtime_feedback() {
+     const bool finite = std::isfinite(motor.get_position()) &&
+                         std::isfinite(motor.get_velocity()) &&
+                         std::isfinite(motor.get_torque());
+-    const bool velocity_ok =
++    const bool velocity_limit_ok =
+         std::abs(motor.get_velocity()) <= max_abs_velocity;
+     const bool torque_ok = std::abs(motor.get_torque()) <= max_abs_torque;
+     const bool temperature_ok =
+@@ -807,18 +941,20 @@ bool OpenArmHW::collect_runtime_feedback() {
+         "runtime side=%s can=%s %s axis=%zu can_id=0x%02x "
+         "count=%llu->%llu changed=%s "
+         "fresh=%s age_ms=%.3f raw_status=%d expected=1 finite=%s "
+-        "velocity_ok=%s velocity_limit=%.6f torque_limit_ok=%s "
+-        "torque_gate_ok=%s torque_pending=%s temperature_ok=%s q=%.6f dq=%.6f "
+-        "tau=%.6f tmos=%d trotor=%d",
++        "velocity_limit_ok=%s velocity_limit=%.6f velocity_gate_ok=%s "
++        "velocity_pending=%s torque_limit_ok=%s torque_gate_ok=%s "
++        "torque_pending=%s temperature_ok=%s q=%.6f dq=%.6f tau=%.6f "
++        "tmos=%d trotor=%d",
+         side, can_interface_.c_str(), component, axis,
+         static_cast<unsigned int>(motor.get_recv_can_id()),
+         static_cast<unsigned long long>(previous_count),
+         static_cast<unsigned long long>(motor.state_update_count()),
+         counter_changed ? "yes" : "no", is_fresh ? "yes" : "no",
+         feedback_age_ms, motor.get_status(), finite ? "yes" : "no",
+-        velocity_ok ? "yes" : "no", max_abs_velocity,
+-        torque_ok ? "yes" : "no", torque_gate_ok ? "yes" : "no",
+-        torque_pending ? "yes" : "no",
++        velocity_limit_ok ? "yes" : "no", max_abs_velocity,
++        velocity_gate_ok ? "yes" : "no",
++        velocity_pending ? "yes" : "no", torque_ok ? "yes" : "no",
++        torque_gate_ok ? "yes" : "no", torque_pending ? "yes" : "no",
+         temperature_ok ? "yes" : "no", motor.get_position(),
+         motor.get_velocity(), motor.get_torque(), motor.get_state_tmos(),
+         motor.get_state_trotor());
+@@ -827,14 +963,20 @@ bool OpenArmHW::collect_runtime_feedback() {
+     log_runtime_motor("arm", i + 1, arm_motors[i],
+                       runtime_feedback_counts_[i], fresh[i], age_ms[i],
+                       MAX_ABS_FEEDBACK_VELOCITY[i],
+-                      MAX_ABS_FEEDBACK_TORQUE[i], torque_policy_ok[i],
++                      MAX_ABS_FEEDBACK_TORQUE[i],
++                      std::abs(arm_motors[i].get_velocity()) <=
++                          MAX_ABS_FEEDBACK_VELOCITY[i],
++                      false, torque_policy_ok[i],
+                       runtime_torque_excursions_[i].pending);
+   }
+   if (hand_) {
+     log_runtime_motor("gripper", 1, gripper_motors.front(),
+                       runtime_gripper_feedback_count_, gripper_fresh,
+                       gripper_age_ms, MAX_ABS_GRIPPER_FEEDBACK_VELOCITY,
+-                      MAX_ABS_GRIPPER_FEEDBACK_TORQUE, true, false);
++                      MAX_ABS_GRIPPER_FEEDBACK_TORQUE,
++                      gripper_velocity_policy_ok,
++                      runtime_gripper_velocity_excursion_.over_limit_run,
++                      true, false);
+   }
+   return false;
+ }
+@@ -967,6 +1109,7 @@ bool OpenArmHW::best_effort_disable() noexcept {
+   runtime_feedback_watchdog_seeded_ = false;
+   runtime_feedback_bootstrap_pending_ = false;
+   reset_runtime_torque_excursions();
++  reset_runtime_gripper_velocity_excursion();
+   for (int attempt = 1; attempt <= BEST_EFFORT_DISABLE_ATTEMPTS; ++attempt) {
+     try {
+       openarm_->set_callback_mode_all(
+@@ -1010,6 +1153,7 @@ hardware_interface::CallbackReturn OpenArmHW::on_activate(
+     runtime_feedback_watchdog_seeded_ = false;
+     runtime_feedback_bootstrap_pending_ = false;
+     reset_runtime_torque_excursions();
++    reset_runtime_gripper_velocity_excursion();
+ 
+     // Disable is the only activation command that may be retried. Every retry
+     // is an independent causal transaction with a new quiet drain and counter
+@@ -1115,6 +1259,7 @@ hardware_interface::CallbackReturn OpenArmHW::on_deactivate(
+   runtime_feedback_watchdog_seeded_ = false;
+   runtime_feedback_bootstrap_pending_ = false;
+   reset_runtime_torque_excursions();
++  reset_runtime_gripper_velocity_excursion();
+ 
+   if (!best_effort_disable()) {
+     RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),

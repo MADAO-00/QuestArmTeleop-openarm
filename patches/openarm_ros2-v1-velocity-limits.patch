@@ -1,0 +1,124 @@
+diff --git a/openarm_hardware/src/openarm_simple_hardware.cpp b/openarm_hardware/src/openarm_simple_hardware.cpp
+--- a/openarm_hardware/src/openarm_simple_hardware.cpp
++++ b/openarm_hardware/src/openarm_simple_hardware.cpp
+@@ -38,28 +38,31 @@ constexpr int FEEDBACK_RECV_SLICE_US = 1000;
+ constexpr auto ACTIVATION_FEEDBACK_TIMEOUT = std::chrono::milliseconds(20);
+ constexpr auto ENABLE_FEEDBACK_TIMEOUT = std::chrono::milliseconds(100);
+ constexpr auto RUNTIME_FEEDBACK_MAX_AGE = std::chrono::milliseconds(20);
+-constexpr double MAX_ABS_FEEDBACK_VELOCITY = 0.75;
++constexpr std::array<double, 7> MAX_ABS_FEEDBACK_VELOCITY = {
++    15.079644737, 15.079644737, 4.900884539, 4.900884539,
++    18.849555921, 18.849555921, 18.849555921};
+ constexpr int MAX_FEEDBACK_TEMPERATURE = 70;
+ constexpr std::array<double, 7> MAX_ABS_FEEDBACK_TORQUE = {
+     40.0, 40.0, 27.0, 27.0, 7.0, 7.0, 7.0};
+ constexpr double MAX_ABS_GRIPPER_FEEDBACK_TORQUE = 7.0;
+ // Exact hard position limits from the pinned official OpenArm v1 bimanual model.
+-constexpr std::array<double, 7> LEFT_LOWER_POSITION_LIMITS = {
++constexpr std::array<double, 7> LEFT_HARD_LOWER_POSITION_LIMITS = {
+     -3.490659, -3.3161253267948965, -1.570796, 0.0,
+     -1.570796, -0.785398, -1.570796};
+-constexpr std::array<double, 7> LEFT_UPPER_POSITION_LIMITS = {
++constexpr std::array<double, 7> LEFT_HARD_UPPER_POSITION_LIMITS = {
+     1.3962629999999998, 0.17453267320510335, 1.570796, 2.443461,
+     1.570796, 0.785398, 1.570796};
+-constexpr std::array<double, 7> RIGHT_LOWER_POSITION_LIMITS = {
++constexpr std::array<double, 7> RIGHT_HARD_LOWER_POSITION_LIMITS = {
+     -1.396263, -0.17453267320510335, -1.570796, 0.0,
+     -1.570796, -0.785398, -1.570796};
+-constexpr std::array<double, 7> RIGHT_UPPER_POSITION_LIMITS = {
++constexpr std::array<double, 7> RIGHT_HARD_UPPER_POSITION_LIMITS = {
+     3.490659, 3.3161253267948965, 1.570796, 2.443461,
+     1.570796, 0.785398, 1.570796};
+ constexpr std::array<double, 7> MAX_COMMAND_VELOCITY = {
+-    0.20, 0.20, 0.25, 0.25, 0.35, 0.35, 0.35};
+-constexpr double POSITION_TOKEN_BURST_SECONDS = 0.050;
+-constexpr double MAX_TRACKING_ERROR = 0.12;
++    1.413, 1.413, 2.826, 2.826, 11.34, 11.34, 11.34};
++constexpr double POSITION_TOKEN_BURST_SECONDS = 0.020;
++constexpr std::array<double, 7> MAX_TRACKING_ERROR = {
++    0.12, 0.12, 0.12, 0.12, 0.24, 0.24, 0.24};
+-constexpr double MAX_ABS_GRIPPER_FEEDBACK_VELOCITY = 1.05;
++constexpr double MAX_ABS_GRIPPER_FEEDBACK_VELOCITY = 18.849555921;
+ constexpr double GRIPPER_LOWER_POSITION_LIMIT = 0.0;
+ constexpr double GRIPPER_UPPER_POSITION_LIMIT = 0.044;
+@@ -419,7 +421,7 @@ bool OpenArmHW::run_feedback_transaction(
+     if (valid) {
+       for (size_t i = 0; i < ARM_DOF; ++i) {
+         if (!validate_motor(arm_before[i], arm_after[i],
+-                            MAX_ABS_FEEDBACK_VELOCITY,
++                            MAX_ABS_FEEDBACK_VELOCITY[i],
+                             MAX_ABS_FEEDBACK_TORQUE[i])) {
+           valid = false;
+           break;
+@@ -484,7 +486,7 @@ bool OpenArmHW::run_feedback_transaction(
+   };
+   for (size_t i = 0; i < ARM_DOF; ++i) {
+     log_motor("arm", i + 1, arm_before[i], arm_after[i],
+-              MAX_ABS_FEEDBACK_VELOCITY,
++              MAX_ABS_FEEDBACK_VELOCITY[i],
+               MAX_ABS_FEEDBACK_TORQUE[i]);
+   }
+   if (hand_) {
+@@ -595,7 +597,7 @@ bool OpenArmHW::collect_runtime_feedback() {
+       next_times[i] = now;
+     }
+     age_ms[i] = std::chrono::duration<double, std::milli>(now - next_times[i]).count();
+-    if (!feedback_values_valid(arm_motors[i], MAX_ABS_FEEDBACK_VELOCITY,
++    if (!feedback_values_valid(arm_motors[i], MAX_ABS_FEEDBACK_VELOCITY[i],
+                                MAX_ABS_FEEDBACK_TORQUE[i]) ||
+         now - next_times[i] > RUNTIME_FEEDBACK_MAX_AGE) {
+       valid = false;
+@@ -679,7 +681,7 @@ bool OpenArmHW::collect_runtime_feedback() {
+   for (size_t i = 0; i < ARM_DOF; ++i) {
+     log_runtime_motor("arm", i + 1, arm_motors[i],
+                       runtime_feedback_counts_[i], fresh[i], age_ms[i],
+-                      MAX_ABS_FEEDBACK_VELOCITY,
++                      MAX_ABS_FEEDBACK_VELOCITY[i],
+                       MAX_ABS_FEEDBACK_TORQUE[i]);
+   }
+   if (hand_) {
+@@ -757,10 +759,10 @@ bool OpenArmHW::seed_commands_from_feedback() {
+   }
+-  const auto& lower_limits = arm_prefix_ == "left_"
+-                                 ? LEFT_LOWER_POSITION_LIMITS
+-                                 : RIGHT_LOWER_POSITION_LIMITS;
+-  const auto& upper_limits = arm_prefix_ == "left_"
+-                                 ? LEFT_UPPER_POSITION_LIMITS
+-                                 : RIGHT_UPPER_POSITION_LIMITS;
++  const auto& lower_limits = arm_prefix_ == "left_"
++                                 ? LEFT_HARD_LOWER_POSITION_LIMITS
++                                 : RIGHT_HARD_LOWER_POSITION_LIMITS;
++  const auto& upper_limits = arm_prefix_ == "left_"
++                                 ? LEFT_HARD_UPPER_POSITION_LIMITS
++                                 : RIGHT_HARD_UPPER_POSITION_LIMITS;
+ 
+   for (size_t i = 0; i < ARM_DOF; ++i) {
+     const double position = arm_motors[i].get_position();
+@@ -1092,11 +1094,11 @@ hardware_interface::return_type OpenArmHW::write(
+   const double bounded_period =
+       std::min(period_seconds, POSITION_TOKEN_BURST_SECONDS);
+-  const auto& lower_limits = arm_prefix_ == "left_"
+-                                 ? LEFT_LOWER_POSITION_LIMITS
+-                                 : RIGHT_LOWER_POSITION_LIMITS;
+-  const auto& upper_limits = arm_prefix_ == "left_"
+-                                 ? LEFT_UPPER_POSITION_LIMITS
+-                                 : RIGHT_UPPER_POSITION_LIMITS;
++  const auto& lower_limits = arm_prefix_ == "left_"
++                                 ? LEFT_HARD_LOWER_POSITION_LIMITS
++                                 : RIGHT_HARD_LOWER_POSITION_LIMITS;
++  const auto& upper_limits = arm_prefix_ == "left_"
++                                 ? LEFT_HARD_UPPER_POSITION_LIMITS
++                                 : RIGHT_HARD_UPPER_POSITION_LIMITS;
+   auto next_tokens = position_tokens_;
+   double next_gripper_tokens = gripper_position_tokens_;
+ 
+@@ -1113,7 +1115,7 @@ hardware_interface::return_type OpenArmHW::write(
+       return runtime_fault();
+     }
+     if (!std::isfinite(pos_states_[i]) ||
+-        std::abs(pos_commands_[i] - pos_states_[i]) > MAX_TRACKING_ERROR) {
++        std::abs(pos_commands_[i] - pos_states_[i]) > MAX_TRACKING_ERROR[i]) {
+       RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
+                    "Rejected joint %zu command with excessive tracking error",
+                    i + 1);

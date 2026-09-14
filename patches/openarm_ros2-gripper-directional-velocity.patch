@@ -1,0 +1,120 @@
+--- a/openarm_hardware/include/openarm_hardware/openarm_simple_hardware.hpp
++++ b/openarm_hardware/include/openarm_hardware/openarm_simple_hardware.hpp
+@@ -141,7 +141,7 @@
+   std::array<double, ARM_DOF> last_accepted_positions_{};
+   std::array<double, ARM_DOF> position_tokens_{};
+   double last_accepted_gripper_position_ = 0.0;
+-  double gripper_position_tokens_ = 0.0;
++  double gripper_motion_time_credit_ = 0.0;
+   bool command_gate_seeded_ = false;
+   struct RuntimeTorqueExcursionState {
+     bool pending = false;
+--- a/openarm_hardware/src/openarm_simple_hardware.cpp
++++ b/openarm_hardware/src/openarm_simple_hardware.cpp
+@@ -71,7 +71,8 @@
+ constexpr double GRIPPER_UPPER_POSITION_LIMIT = 0.044;
+ constexpr double GRIPPER_FEEDBACK_POSITION_TOLERANCE = 0.00002;
+ constexpr double MAX_GRIPPER_TRACKING_ERROR = 0.00504;
+-constexpr double MAX_GRIPPER_COMMAND_VELOCITY = 0.0147;
++constexpr double MAX_GRIPPER_OPEN_COMMAND_VELOCITY = 0.5000;
++constexpr double MAX_GRIPPER_CLOSE_COMMAND_VELOCITY = 0.5000;
+ constexpr auto GRIPPER_MODE_ACK_TIMEOUT = std::chrono::milliseconds(100);
+ }  // namespace
+ 
+@@ -895,7 +896,7 @@
+ 
+ bool OpenArmHW::seed_commands_from_feedback() {
+   command_gate_seeded_ = false;
+-  gripper_position_tokens_ = 0.0;
++  gripper_motion_time_credit_ = 0.0;
+   last_accepted_gripper_position_ = 0.0;
+   const auto arm_motors = openarm_->get_arm().get_motors();
+   if (arm_motors.size() != ARM_DOF || pos_commands_.size() != joint_names_.size()) {
+@@ -955,8 +956,7 @@
+     vel_commands_[ARM_DOF] = 0.0;
+     tau_commands_[ARM_DOF] = 0.0;
+     last_accepted_gripper_position_ = joint_position;
+-    gripper_position_tokens_ =
+-        MAX_GRIPPER_COMMAND_VELOCITY * POSITION_TOKEN_BURST_SECONDS;
++    gripper_motion_time_credit_ = POSITION_TOKEN_BURST_SECONDS;
+   }
+ 
+   command_gate_seeded_ = true;
+@@ -1246,7 +1246,7 @@
+                                  ? LEFT_HARD_UPPER_POSITION_LIMITS
+                                  : RIGHT_HARD_UPPER_POSITION_LIMITS;
+   auto next_tokens = position_tokens_;
+-  double next_gripper_tokens = gripper_position_tokens_;
++  double next_gripper_motion_time_credit = gripper_motion_time_credit_;
+ 
+   for (size_t i = 0; i < ARM_DOF; ++i) {
+     if (pos_commands_[i] < lower_limits[i] ||
+@@ -1291,7 +1291,9 @@
+         pos_states_.size() != ARM_DOF + 1 ||
+         !std::isfinite(pos_states_[ARM_DOF]) ||
+         !std::isfinite(last_accepted_gripper_position_) ||
+-        !std::isfinite(next_gripper_tokens) || next_gripper_tokens < 0.0) {
++        !std::isfinite(next_gripper_motion_time_credit) ||
++        next_gripper_motion_time_credit < 0.0 ||
++        next_gripper_motion_time_credit > POSITION_TOKEN_BURST_SECONDS) {
+       RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
+                    "Rejected malformed or non-finite gripper gate state");
+       return runtime_fault();
+@@ -1317,21 +1319,34 @@
+       return runtime_fault();
+     }
+ 
+-    const double capacity =
+-        MAX_GRIPPER_COMMAND_VELOCITY * POSITION_TOKEN_BURST_SECONDS;
+-    next_gripper_tokens =
+-        std::min(capacity,
+-                 next_gripper_tokens +
+-                     MAX_GRIPPER_COMMAND_VELOCITY * bounded_period);
+-    const double requested_step = std::abs(
+-        pos_commands_[ARM_DOF] - last_accepted_gripper_position_);
+-    if (requested_step > next_gripper_tokens + 1e-12) {
+-      RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
+-                   "Rejected gripper command exceeding the 0.0147 m/s "
+-                   "hardware rate gate");
+-      return runtime_fault();
++    next_gripper_motion_time_credit =
++        std::min(POSITION_TOKEN_BURST_SECONDS,
++                 next_gripper_motion_time_credit + bounded_period);
++
++    const double requested_delta =
++        pos_commands_[ARM_DOF] - last_accepted_gripper_position_;
++    const double requested_step = std::abs(requested_delta);
++    if (requested_delta != 0.0) {
++      const double active_velocity =
++          requested_delta > 0.0 ? MAX_GRIPPER_OPEN_COMMAND_VELOCITY
++                                : MAX_GRIPPER_CLOSE_COMMAND_VELOCITY;
++      const double requested_time = requested_step / active_velocity;
++      if (!std::isfinite(requested_time) ||
++          requested_time > next_gripper_motion_time_credit + 1e-12) {
++        RCLCPP_ERROR(
++            rclcpp::get_logger("OpenArmHW"),
++            "Rejected gripper %s command exceeding the %.4f m/s hardware "
++            "rate gate side=%s can=%s requested_step=%.9f "
++            "requested_time=%.9f time_credit=%.9f",
++            requested_delta > 0.0 ? "open" : "close", active_velocity,
++            arm_prefix_ == "left_" ? "left" : "right",
++            can_interface_.c_str(), requested_step, requested_time,
++            next_gripper_motion_time_credit);
++        return runtime_fault();
++      }
++      next_gripper_motion_time_credit = std::max(
++          0.0, next_gripper_motion_time_credit - requested_time);
+     }
+-    next_gripper_tokens -= requested_step;
+   }
+ 
+   position_tokens_ = next_tokens;
+@@ -1339,7 +1354,7 @@
+     last_accepted_positions_[i] = pos_commands_[i];
+   }
+   if (hand_) {
+-    gripper_position_tokens_ = next_gripper_tokens;
++    gripper_motion_time_credit_ = next_gripper_motion_time_credit;
+     last_accepted_gripper_position_ = pos_commands_[ARM_DOF];
+   }
+ 

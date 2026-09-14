@@ -1,0 +1,30 @@
+diff --git a/openarm_control/kinematics.py b/openarm_control/kinematics.py
+--- a/openarm_control/kinematics.py
++++ b/openarm_control/kinematics.py
+@@ -240,23 +240,10 @@ class _IKSolver:
+                     safety_break=False,
+                     **self._solver_params,
+                 )
+             except mink.exceptions.NoSolutionFound:
+-                try:
+-                    vel = mink.solve_ik(
+-                        self._config,
+-                        tasks,
+-                        self._dt,
+-                        self._solver_name,
+-                        limits=[],
+-                        constraints=constraints,
+-                        safety_break=False,
+-                        **self._solver_params,
+-                    )
+-                except mink.exceptions.NoSolutionFound:
+-                    print(
+-                        "Warning: IK solver failed (constrained and unconstrained). Skipping step."
+-                    )
+-                    return None
++                print("Warning: constrained IK solver failed. Skipping step.")
++                self._pending = set(self._sides)
++                return None
+             self._config.integrate_inplace(vel, self._dt)
+ 
+         self._pending = set(self._sides)

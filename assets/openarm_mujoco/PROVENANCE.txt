@@ -1,0 +1,5 @@
+Source: https://github.com/enactic/openarm_mujoco
+Commit: 8955afb54e4adfb59a236e2b4d15192b7a02865c
+Imported path: v1/
+scene.xml SHA256: c0263cda0c391162bce4b45ed1a4154b453603bb2a21427f0dc7bce9cb39edf0
+License: Apache-2.0 (see LICENSE)

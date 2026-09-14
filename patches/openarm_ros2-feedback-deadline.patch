@@ -1,0 +1,695 @@
+--- a/openarm_hardware/include/openarm_hardware/openarm_simple_hardware.hpp
++++ b/openarm_hardware/include/openarm_hardware/openarm_simple_hardware.hpp
+@@ -16,6 +16,8 @@
+ 
+ #include <array>
+ #include <chrono>
++#include <cstdint>
++#include <functional>
+ #include <memory>
+ #include <openarm/can/socket/openarm.hpp>
+ #include <openarm/damiao_motor/dm_motor_constants.hpp>
+@@ -139,6 +141,12 @@
+   std::array<double, ARM_DOF> last_accepted_positions_{};
+   std::array<double, ARM_DOF> position_tokens_{};
+   bool command_gate_seeded_ = false;
++  std::array<uint64_t, ARM_DOF> runtime_feedback_counts_{};
++  std::array<std::chrono::steady_clock::time_point, ARM_DOF>
++      runtime_feedback_times_{};
++  uint64_t runtime_gripper_feedback_count_ = 0;
++  std::chrono::steady_clock::time_point runtime_gripper_feedback_time_{};
++  bool runtime_feedback_watchdog_seeded_ = false;
+ 
+   static constexpr std::array<double, ARM_DOF> ZERO_POSITION = {
+       0.0,  // joint1
+@@ -152,9 +160,16 @@
+ 
+   // Helper methods
+   void return_to_zero();
+-  bool wait_for_fresh_feedback(bool expected_enabled, const char* phase);
++  bool drain_feedback_until_quiet(const char* phase);
++  bool run_feedback_transaction(
++      int expected_status, const char* phase,
++      std::chrono::microseconds timeout,
++      const std::function<void()>& send_once,
++      bool send_disable_if_busy = false);
++  bool seed_runtime_feedback_watchdog();
++  bool collect_runtime_feedback();
+   bool seed_commands_from_feedback();
+-  void best_effort_disable() noexcept;
++  bool best_effort_disable() noexcept;
+   bool parse_config(const hardware_interface::HardwareInfo& info);
+   void generate_joint_names();
+ 
+--- a/openarm_hardware/src/openarm_simple_hardware.cpp
++++ b/openarm_hardware/src/openarm_simple_hardware.cpp
+@@ -30,8 +30,14 @@
+ namespace openarm_hardware {
+ 
+ namespace {
+-constexpr int FEEDBACK_ATTEMPTS = 3;
+-constexpr int FEEDBACK_TIMEOUT_US = 5000;
++constexpr int BEST_EFFORT_DISABLE_ATTEMPTS = 3;
++constexpr int PREACTIVATION_DISABLE_ATTEMPTS = 3;
++constexpr int FEEDBACK_DRAIN_MAX_PASSES = 5;
++constexpr int FEEDBACK_DRAIN_SLICE_US = 1000;
++constexpr int FEEDBACK_RECV_SLICE_US = 1000;
++constexpr auto ACTIVATION_FEEDBACK_TIMEOUT = std::chrono::milliseconds(20);
++constexpr auto ENABLE_FEEDBACK_TIMEOUT = std::chrono::milliseconds(100);
++constexpr auto RUNTIME_FEEDBACK_MAX_AGE = std::chrono::milliseconds(20);
+ constexpr double MAX_ABS_FEEDBACK_VELOCITY = 0.75;
+ constexpr int MAX_FEEDBACK_TEMPERATURE = 70;
+ constexpr std::array<double, 7> MAX_ABS_FEEDBACK_TORQUE = {
+@@ -250,45 +256,135 @@
+   return command_interfaces;
+ }
+ 
+-bool OpenArmHW::wait_for_fresh_feedback(bool expected_enabled,
+-                                        const char* phase) {
+-  // Keep one baseline across bounded retries so replies that arrive in
+-  // separate socket drains still count toward one complete fresh sample.
+-  const auto arm_before = openarm_->get_arm().get_motors();
+-  const auto gripper_before =
+-      hand_ ? openarm_->get_gripper().get_motors()
+-            : std::vector<openarm::damiao_motor::Motor>{};
+-
+-  for (int attempt = 1; attempt <= FEEDBACK_ATTEMPTS; ++attempt) {
+-    openarm_->refresh_all();
+-    openarm_->recv_all(FEEDBACK_TIMEOUT_US);
++bool OpenArmHW::drain_feedback_until_quiet(const char* phase) {
++  for (int pass = 1; pass <= FEEDBACK_DRAIN_MAX_PASSES; ++pass) {
++    const auto arm_before = openarm_->get_arm().get_motors();
++    const auto gripper_before =
++        hand_ ? openarm_->get_gripper().get_motors()
++              : std::vector<openarm::damiao_motor::Motor>{};
++    if (arm_before.size() != ARM_DOF ||
++        (hand_ && gripper_before.size() != 1)) {
++      RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                   "Malformed feedback while draining before %s: arm=%zu "
++                   "gripper=%zu",
++                   phase, arm_before.size(), gripper_before.size());
++      return false;
++    }
+ 
++    openarm_->recv_all(FEEDBACK_DRAIN_SLICE_US);
+     const auto arm_after = openarm_->get_arm().get_motors();
+     const auto gripper_after =
+         hand_ ? openarm_->get_gripper().get_motors()
+               : std::vector<openarm::damiao_motor::Motor>{};
++    if (arm_after.size() != ARM_DOF ||
++        (hand_ && gripper_after.size() != 1)) {
++      RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                   "Malformed feedback after drain pass %d before %s: arm=%zu "
++                   "gripper=%zu",
++                   pass, phase, arm_after.size(), gripper_after.size());
++      return false;
++    }
+ 
+-    bool valid = arm_before.size() == ARM_DOF && arm_after.size() == ARM_DOF;
++    bool changed = false;
++    for (size_t i = 0; i < ARM_DOF; ++i) {
++      changed = changed || arm_after[i].state_update_count() !=
++                               arm_before[i].state_update_count();
++    }
+     if (hand_) {
+-      valid = valid && gripper_before.size() == 1 && gripper_after.size() == 1;
++      changed =
++          changed || gripper_after.front().state_update_count() !=
++                         gripper_before.front().state_update_count();
++    }
++    if (!changed) {
++      return true;
++    }
++  }
++
++  RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++               "Feedback did not become quiet within %d bounded drain passes "
++               "before %s",
++               FEEDBACK_DRAIN_MAX_PASSES, phase);
++  return false;
++}
++
++bool OpenArmHW::run_feedback_transaction(
++    int expected_status, const char* phase, std::chrono::microseconds timeout,
++    const std::function<void()>& send_once, bool send_disable_if_busy) {
++  if ((expected_status != 0 && expected_status != 1) || timeout.count() <= 0 ||
++      !send_once || (send_disable_if_busy && expected_status != 0)) {
++    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                 "Invalid feedback transaction configuration during %s",
++                 phase);
++    return false;
++  }
++
++  // Establish a quiet receive boundary, take a new per-transaction baseline,
++  // then send the causal command once. A command is not sent if a quiet boundary
++  // cannot be established. Only callers issuing the fail-closed disable command
++  // may explicitly request one unconfirmed send on a busy stream.
++  const bool quiet = drain_feedback_until_quiet(phase);
++  if (!quiet) {
++    if (!send_disable_if_busy) {
++      return false;
+     }
++    RCLCPP_WARN(rclcpp::get_logger("OpenArmHW"),
++                "Sending the fail-closed disable command during %s despite a "
++                "busy feedback stream; this attempt cannot be confirmed",
++                phase);
++    send_once();
++    return false;
++  }
++  const auto arm_before = openarm_->get_arm().get_motors();
++  const auto gripper_before =
++      hand_ ? openarm_->get_gripper().get_motors()
++            : std::vector<openarm::damiao_motor::Motor>{};
++  if (arm_before.size() != ARM_DOF ||
++      (hand_ && gripper_before.size() != 1)) {
++    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                 "Malformed feedback baseline during %s: arm=%zu gripper=%zu",
++                 phase, arm_before.size(), gripper_before.size());
++    return false;
++  }
+ 
+-    auto validate_motor = [&](const openarm::damiao_motor::Motor& before,
+-                              const openarm::damiao_motor::Motor& after,
+-                              double max_abs_torque) {
+-      return after.state_update_count() > before.state_update_count() &&
+-             std::isfinite(after.get_position()) &&
+-             std::isfinite(after.get_velocity()) &&
+-             std::isfinite(after.get_torque()) &&
+-             std::abs(after.get_velocity()) <= MAX_ABS_FEEDBACK_VELOCITY &&
+-             std::abs(after.get_torque()) <= max_abs_torque &&
+-             after.get_state_tmos() >= 0 &&
+-             after.get_state_tmos() <= MAX_FEEDBACK_TEMPERATURE &&
+-             after.get_state_trotor() >= 0 &&
+-             after.get_state_trotor() <= MAX_FEEDBACK_TEMPERATURE &&
+-             after.is_enabled() == expected_enabled;
+-    };
++  send_once();
++  const auto deadline = std::chrono::steady_clock::now() + timeout;
+ 
++  auto arm_after = arm_before;
++  auto gripper_after = gripper_before;
++  auto validate_motor = [&](const openarm::damiao_motor::Motor& before,
++                            const openarm::damiao_motor::Motor& after,
++                            double max_abs_torque) {
++    return after.state_update_count() != before.state_update_count() &&
++           after.get_status() == expected_status &&
++           std::isfinite(after.get_position()) &&
++           std::isfinite(after.get_velocity()) &&
++           std::isfinite(after.get_torque()) &&
++           std::abs(after.get_velocity()) <= MAX_ABS_FEEDBACK_VELOCITY &&
++           std::abs(after.get_torque()) <= max_abs_torque &&
++           after.get_state_tmos() >= 0 &&
++           after.get_state_tmos() <= MAX_FEEDBACK_TEMPERATURE &&
++           after.get_state_trotor() >= 0 &&
++           after.get_state_trotor() <= MAX_FEEDBACK_TEMPERATURE;
++  };
++
++  while (std::chrono::steady_clock::now() < deadline) {
++    const auto now = std::chrono::steady_clock::now();
++    const auto remaining =
++        std::chrono::duration_cast<std::chrono::microseconds>(deadline - now);
++    if (remaining.count() <= 0) {
++      break;
++    }
++    const int slice_us = static_cast<int>(
++        std::min(remaining, std::chrono::microseconds(FEEDBACK_RECV_SLICE_US))
++            .count());
++    openarm_->recv_all(slice_us);
++
++    arm_after = openarm_->get_arm().get_motors();
++    gripper_after =
++        hand_ ? openarm_->get_gripper().get_motors()
++              : std::vector<openarm::damiao_motor::Motor>{};
++    bool valid = arm_after.size() == ARM_DOF &&
++                 (!hand_ || gripper_after.size() == 1);
+     if (valid) {
+       for (size_t i = 0; i < ARM_DOF; ++i) {
+         if (!validate_motor(arm_before[i], arm_after[i],
+@@ -303,18 +399,227 @@
+                         MAX_ABS_GRIPPER_FEEDBACK_TORQUE)) {
+       valid = false;
+     }
+-
+     if (valid) {
+       return true;
+     }
++  }
+ 
+-    RCLCPP_WARN(rclcpp::get_logger("OpenArmHW"),
+-                "Fresh %s feedback validation failed during %s "
+-                "(attempt %d/%d)",
+-                expected_enabled ? "enabled" : "disabled", phase, attempt,
+-                FEEDBACK_ATTEMPTS);
++  RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++               "Feedback transaction timed out during %s after %.3f ms",
++               phase, static_cast<double>(timeout.count()) / 1000.0);
++  if (arm_after.size() != ARM_DOF ||
++      (hand_ && gripper_after.size() != 1)) {
++    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                 "Malformed feedback result during %s: arm=%zu gripper=%zu",
++                 phase, arm_after.size(), gripper_after.size());
++    return false;
++  }
++
++  auto log_motor = [&](const char* component, size_t axis,
++                       const openarm::damiao_motor::Motor& before,
++                       const openarm::damiao_motor::Motor& after,
++                       double max_abs_torque) {
++    const bool fresh =
++        after.state_update_count() != before.state_update_count();
++    const bool finite = std::isfinite(after.get_position()) &&
++                        std::isfinite(after.get_velocity()) &&
++                        std::isfinite(after.get_torque());
++    const bool velocity_ok =
++        std::abs(after.get_velocity()) <= MAX_ABS_FEEDBACK_VELOCITY;
++    const bool torque_ok = std::abs(after.get_torque()) <= max_abs_torque;
++    const bool temperature_ok =
++        after.get_state_tmos() >= 0 &&
++        after.get_state_tmos() <= MAX_FEEDBACK_TEMPERATURE &&
++        after.get_state_trotor() >= 0 &&
++        after.get_state_trotor() <= MAX_FEEDBACK_TEMPERATURE;
++    RCLCPP_ERROR(
++        rclcpp::get_logger("OpenArmHW"),
++        "%s %s axis=%zu can_id=0x%02x count=%llu->%llu fresh=%s "
++        "raw_status=%d expected=%d finite=%s velocity_ok=%s torque_ok=%s "
++        "temperature_ok=%s q=%.6f dq=%.6f tau=%.6f tmos=%d trotor=%d",
++        phase, component, axis,
++        static_cast<unsigned int>(after.get_recv_can_id()),
++        static_cast<unsigned long long>(before.state_update_count()),
++        static_cast<unsigned long long>(after.state_update_count()),
++        fresh ? "yes" : "no", after.get_status(), expected_status,
++        finite ? "yes" : "no", velocity_ok ? "yes" : "no",
++        torque_ok ? "yes" : "no", temperature_ok ? "yes" : "no",
++        after.get_position(), after.get_velocity(), after.get_torque(),
++        after.get_state_tmos(), after.get_state_trotor());
++  };
++  for (size_t i = 0; i < ARM_DOF; ++i) {
++    log_motor("arm", i + 1, arm_before[i], arm_after[i],
++              MAX_ABS_FEEDBACK_TORQUE[i]);
++  }
++  if (hand_) {
++    log_motor("gripper", 1, gripper_before.front(), gripper_after.front(),
++              MAX_ABS_GRIPPER_FEEDBACK_TORQUE);
++  }
++  return false;
++}
++
++bool OpenArmHW::seed_runtime_feedback_watchdog() {
++  runtime_feedback_watchdog_seeded_ = false;
++  const auto arm_motors = openarm_->get_arm().get_motors();
++  const auto gripper_motors =
++      hand_ ? openarm_->get_gripper().get_motors()
++            : std::vector<openarm::damiao_motor::Motor>{};
++  if (arm_motors.size() != ARM_DOF ||
++      (hand_ && gripper_motors.size() != 1)) {
++    return false;
++  }
++
++  const auto now = std::chrono::steady_clock::now();
++  for (size_t i = 0; i < ARM_DOF; ++i) {
++    runtime_feedback_counts_[i] = arm_motors[i].state_update_count();
++    runtime_feedback_times_[i] = now;
++  }
++  if (hand_) {
++    runtime_gripper_feedback_count_ =
++        gripper_motors.front().state_update_count();
++    runtime_gripper_feedback_time_ = now;
++  }
++  runtime_feedback_watchdog_seeded_ = true;
++  return true;
++}
++
++bool OpenArmHW::collect_runtime_feedback() {
++  if (!runtime_feedback_watchdog_seeded_) {
++    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                 "Runtime feedback watchdog was not seeded");
++    return false;
++  }
++
++  // Runtime is a pipeline: write() sends one MIT command per motor and those
++  // replies advance the counters. A single nonblocking drain here consumes any
++  // tail frames without adding a per-arm blocking transaction to the 750 Hz
++  // loop. Missing updates are tolerated only up to the small age watchdog.
++  openarm_->recv_all(0);
++  const auto arm_motors = openarm_->get_arm().get_motors();
++  const auto gripper_motors =
++      hand_ ? openarm_->get_gripper().get_motors()
++            : std::vector<openarm::damiao_motor::Motor>{};
++  if (arm_motors.size() != ARM_DOF ||
++      (hand_ && gripper_motors.size() != 1)) {
++    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                 "Malformed runtime feedback: arm=%zu gripper=%zu",
++                 arm_motors.size(), gripper_motors.size());
++    return false;
++  }
++
++  const auto now = std::chrono::steady_clock::now();
++  auto next_counts = runtime_feedback_counts_;
++  auto next_times = runtime_feedback_times_;
++  std::array<bool, ARM_DOF> fresh{};
++  std::array<double, ARM_DOF> age_ms{};
++  bool valid = true;
++
++  auto feedback_values_valid = [](const openarm::damiao_motor::Motor& motor,
++                                  double max_abs_torque) {
++    return motor.get_status() == 1 && std::isfinite(motor.get_position()) &&
++           std::isfinite(motor.get_velocity()) &&
++           std::isfinite(motor.get_torque()) &&
++           std::abs(motor.get_velocity()) <= MAX_ABS_FEEDBACK_VELOCITY &&
++           std::abs(motor.get_torque()) <= max_abs_torque &&
++           motor.get_state_tmos() >= 0 &&
++           motor.get_state_tmos() <= MAX_FEEDBACK_TEMPERATURE &&
++           motor.get_state_trotor() >= 0 &&
++           motor.get_state_trotor() <= MAX_FEEDBACK_TEMPERATURE;
++  };
++
++  for (size_t i = 0; i < ARM_DOF; ++i) {
++    const auto count = arm_motors[i].state_update_count();
++    if (count != runtime_feedback_counts_[i]) {
++      fresh[i] = true;
++      next_counts[i] = count;
++      next_times[i] = now;
++    }
++    age_ms[i] = std::chrono::duration<double, std::milli>(now - next_times[i]).count();
++    if (!feedback_values_valid(arm_motors[i], MAX_ABS_FEEDBACK_TORQUE[i]) ||
++        now - next_times[i] > RUNTIME_FEEDBACK_MAX_AGE) {
++      valid = false;
++    }
++  }
++
++  bool gripper_fresh = false;
++  double gripper_age_ms = 0.0;
++  uint64_t next_gripper_count = runtime_gripper_feedback_count_;
++  auto next_gripper_time = runtime_gripper_feedback_time_;
++  if (hand_) {
++    const auto count = gripper_motors.front().state_update_count();
++    if (count != runtime_gripper_feedback_count_) {
++      gripper_fresh = true;
++      next_gripper_count = count;
++      next_gripper_time = now;
++    }
++    gripper_age_ms =
++        std::chrono::duration<double, std::milli>(now - next_gripper_time).count();
++    if (!feedback_values_valid(gripper_motors.front(),
++                               MAX_ABS_GRIPPER_FEEDBACK_TORQUE) ||
++        now - next_gripper_time > RUNTIME_FEEDBACK_MAX_AGE) {
++      valid = false;
++    }
++  }
++
++  if (valid) {
++    runtime_feedback_counts_ = next_counts;
++    runtime_feedback_times_ = next_times;
++    if (hand_) {
++      runtime_gripper_feedback_count_ = next_gripper_count;
++      runtime_gripper_feedback_time_ = next_gripper_time;
++    }
++    return true;
+   }
+ 
++  RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++               "Runtime feedback validation failed; max age is %.3f ms",
++               std::chrono::duration<double, std::milli>(
++                   RUNTIME_FEEDBACK_MAX_AGE)
++                   .count());
++  auto log_runtime_motor = [&](const char* component, size_t axis,
++                               const openarm::damiao_motor::Motor& motor,
++                               uint64_t previous_count, bool is_fresh,
++                               double feedback_age_ms,
++                               double max_abs_torque) {
++    const bool counter_changed =
++        motor.state_update_count() != previous_count;
++    const bool finite = std::isfinite(motor.get_position()) &&
++                        std::isfinite(motor.get_velocity()) &&
++                        std::isfinite(motor.get_torque());
++    const bool velocity_ok =
++        std::abs(motor.get_velocity()) <= MAX_ABS_FEEDBACK_VELOCITY;
++    const bool torque_ok = std::abs(motor.get_torque()) <= max_abs_torque;
++    const bool temperature_ok =
++        motor.get_state_tmos() >= 0 &&
++        motor.get_state_tmos() <= MAX_FEEDBACK_TEMPERATURE &&
++        motor.get_state_trotor() >= 0 &&
++        motor.get_state_trotor() <= MAX_FEEDBACK_TEMPERATURE;
++    RCLCPP_ERROR(
++        rclcpp::get_logger("OpenArmHW"),
++        "runtime %s axis=%zu can_id=0x%02x count=%llu->%llu changed=%s "
++        "fresh=%s age_ms=%.3f raw_status=%d expected=1 finite=%s "
++        "velocity_ok=%s torque_ok=%s temperature_ok=%s q=%.6f dq=%.6f "
++        "tau=%.6f tmos=%d trotor=%d",
++        component, axis, static_cast<unsigned int>(motor.get_recv_can_id()),
++        static_cast<unsigned long long>(previous_count),
++        static_cast<unsigned long long>(motor.state_update_count()),
++        counter_changed ? "yes" : "no", is_fresh ? "yes" : "no",
++        feedback_age_ms, motor.get_status(), finite ? "yes" : "no",
++        velocity_ok ? "yes" : "no", torque_ok ? "yes" : "no",
++        temperature_ok ? "yes" : "no", motor.get_position(),
++        motor.get_velocity(), motor.get_torque(), motor.get_state_tmos(),
++        motor.get_state_trotor());
++  };
++  for (size_t i = 0; i < ARM_DOF; ++i) {
++    log_runtime_motor("arm", i + 1, arm_motors[i],
++                      runtime_feedback_counts_[i], fresh[i], age_ms[i],
++                      MAX_ABS_FEEDBACK_TORQUE[i]);
++  }
++  if (hand_) {
++    log_runtime_motor("gripper", 1, gripper_motors.front(),
++                      runtime_gripper_feedback_count_, gripper_fresh,
++                      gripper_age_ms, MAX_ABS_GRIPPER_FEEDBACK_TORQUE);
++  }
+   return false;
+ }
+ 
+@@ -373,20 +678,32 @@
+   return true;
+ }
+ 
+-void OpenArmHW::best_effort_disable() noexcept {
+-  try {
+-    openarm_->set_callback_mode_all(openarm::damiao_motor::CallbackMode::STATE);
+-    for (int attempt = 0; attempt < FEEDBACK_ATTEMPTS; ++attempt) {
+-      openarm_->disable_all();
+-      openarm_->recv_all(FEEDBACK_TIMEOUT_US);
++bool OpenArmHW::best_effort_disable() noexcept {
++  runtime_feedback_watchdog_seeded_ = false;
++  for (int attempt = 1; attempt <= BEST_EFFORT_DISABLE_ATTEMPTS; ++attempt) {
++    try {
++      openarm_->set_callback_mode_all(
++          openarm::damiao_motor::CallbackMode::STATE);
++      if (run_feedback_transaction(
++              0, "fail-safe disable", ACTIVATION_FEEDBACK_TIMEOUT,
++              [this]() { openarm_->disable_all(); }, true)) {
++        return true;
++      }
++      RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                   "Fail-safe disable was not confirmed (attempt %d/%d)",
++                   attempt, BEST_EFFORT_DISABLE_ATTEMPTS);
++    } catch (const std::exception& exception) {
++      RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                   "Fail-safe disable attempt %d/%d raised an exception: %s",
++                   attempt, BEST_EFFORT_DISABLE_ATTEMPTS, exception.what());
++    } catch (...) {
++      RCLCPP_ERROR(
++          rclcpp::get_logger("OpenArmHW"),
++          "Fail-safe disable attempt %d/%d raised an unknown exception",
++          attempt, BEST_EFFORT_DISABLE_ATTEMPTS);
+     }
+-  } catch (const std::exception& exception) {
+-    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
+-                 "Fail-safe disable raised an exception: %s", exception.what());
+-  } catch (...) {
+-    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
+-                 "Fail-safe disable raised an unknown exception");
+   }
++  return false;
+ }
+ 
+ hardware_interface::CallbackReturn OpenArmHW::on_activate(
+@@ -403,12 +720,24 @@
+     RCLCPP_INFO(rclcpp::get_logger("OpenArmHW"),
+                 "Activating OpenArm V10 in current-position hold mode...");
+     openarm_->set_callback_mode_all(openarm::damiao_motor::CallbackMode::STATE);
++    runtime_feedback_watchdog_seeded_ = false;
+ 
+-    // Always establish and verify a fresh disabled baseline first. The update
+-    // counter comes from actual decoded CAN replies, so constructor zeroes can
+-    // never be mistaken for live feedback.
+-    best_effort_disable();
+-    if (!wait_for_fresh_feedback(false, "pre-activation baseline")) {
++    // Disable is the only activation command that may be retried. Every retry
++    // is an independent causal transaction with a new quiet drain and counter
++    // baseline; enable and MIT commands below are never repeated.
++    bool disable_confirmed = false;
++    for (int attempt = 1; attempt <= PREACTIVATION_DISABLE_ATTEMPTS; ++attempt) {
++      if (run_feedback_transaction(
++              0, "pre-activation disable", ACTIVATION_FEEDBACK_TIMEOUT,
++              [this]() { openarm_->disable_all(); }, true)) {
++        disable_confirmed = true;
++        break;
++      }
++      RCLCPP_WARN(rclcpp::get_logger("OpenArmHW"),
++                  "Pre-activation disable confirmation failed (attempt %d/%d)",
++                  attempt, PREACTIVATION_DISABLE_ATTEMPTS);
++    }
++    if (!disable_confirmed) {
+       return fail_activation("motors did not report a fresh disabled state");
+     }
+     if (!seed_commands_from_feedback()) {
+@@ -423,21 +752,26 @@
+     for (size_t i = 0; i < ARM_DOF; ++i) {
+       preload_params.push_back({0.0, 0.0, pos_commands_[i], 0.0, 0.0});
+     }
+-    openarm_->get_arm().mit_control_all(preload_params);
+-    if (hand_) {
+-      openarm_->get_gripper().mit_control_all(
+-          {{0.0, 0.0, joint_to_motor_radians(pos_commands_[ARM_DOF]), 0.0,
+-            0.0}});
+-    }
+-    openarm_->recv_all(FEEDBACK_TIMEOUT_US);
+-    if (!wait_for_fresh_feedback(false, "disabled command preload")) {
++    if (!run_feedback_transaction(
++            0, "disabled command preload", ACTIVATION_FEEDBACK_TIMEOUT,
++            [this, &preload_params]() {
++              openarm_->get_arm().mit_control_all(preload_params);
++              if (hand_) {
++                openarm_->get_gripper().mit_control_all(
++                    {{0.0, 0.0,
++                      joint_to_motor_radians(pos_commands_[ARM_DOF]), 0.0,
++                      0.0}});
++              }
++            })) {
+       return fail_activation("disabled preload was not confirmed");
+     }
+ 
+     // Enabling does not select a new pose. Confirm every motor's fresh enabled
+-    // status before applying the finite current-position hold command.
+-    openarm_->enable_all();
+-    if (!wait_for_fresh_feedback(true, "enable confirmation")) {
++    // status before applying the finite current-position hold command. Enable
++    // is transmitted exactly once; its slower transition gets a wider deadline.
++    if (!run_feedback_transaction(
++            1, "enable confirmation", ENABLE_FEEDBACK_TIMEOUT,
++            [this]() { openarm_->enable_all(); })) {
+       return fail_activation("not every arm motor confirmed enabled");
+     }
+     // Re-sample after the zero-gain enable window. The full-gain hold must use
+@@ -452,16 +786,22 @@
+       hold_params.push_back(
+           {kp_[i], kd_[i], pos_commands_[i], 0.0, 0.0});
+     }
+-    openarm_->get_arm().mit_control_all(hold_params);
+-    if (hand_) {
+-      openarm_->get_gripper().mit_control_all(
+-          {{gripper_kp_, gripper_kd_,
+-            joint_to_motor_radians(pos_commands_[ARM_DOF]), 0.0, 0.0}});
+-    }
+-    openarm_->recv_all(FEEDBACK_TIMEOUT_US);
+-    if (!wait_for_fresh_feedback(true, "initial current-position hold")) {
++    if (!run_feedback_transaction(
++            1, "initial current-position hold", ACTIVATION_FEEDBACK_TIMEOUT,
++            [this, &hold_params]() {
++              openarm_->get_arm().mit_control_all(hold_params);
++              if (hand_) {
++                openarm_->get_gripper().mit_control_all(
++                    {{gripper_kp_, gripper_kd_,
++                      joint_to_motor_radians(pos_commands_[ARM_DOF]), 0.0,
++                      0.0}});
++              }
++            })) {
+       return fail_activation("initial current-position hold was not confirmed");
+     }
++    if (!seed_runtime_feedback_watchdog()) {
++      return fail_activation("runtime feedback watchdog could not be seeded");
++    }
+ 
+     RCLCPP_INFO(rclcpp::get_logger("OpenArmHW"),
+                 "OpenArm V10 activated at the measured current position");
+@@ -484,12 +824,13 @@
+ hardware_interface::CallbackReturn OpenArmHW::on_deactivate(
+     const rclcpp_lifecycle::State& /*previous_state*/) {
+   RCLCPP_INFO(rclcpp::get_logger("OpenArmHW"), "Deactivating OpenArm V10...");
++  runtime_feedback_watchdog_seeded_ = false;
+ 
+-  // Disable all motors (like full_arm.cpp exit)
+-  for (int i = 0; i < 3; ++i) {
+-    openarm_->disable_all();
+-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+-    openarm_->recv_all();
++  if (!best_effort_disable()) {
++    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                 "OpenArm V10 deactivation could not confirm status 0");
++    rclcpp::shutdown();
++    return CallbackReturn::ERROR;
+   }
+ 
+   RCLCPP_INFO(rclcpp::get_logger("OpenArmHW"), "OpenArm V10 deactivated");
+@@ -499,39 +840,39 @@
+ hardware_interface::return_type OpenArmHW::read(
+     const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/) {
+   try {
+-  if (!wait_for_fresh_feedback(true, "runtime read")) {
+-    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
+-                 "Fresh enabled feedback was not received for every motor; "
+-                 "disabling hardware instead of publishing stale state");
+-    best_effort_disable();
+-    rclcpp::shutdown();
+-    return hardware_interface::return_type::ERROR;
+-  }
+-
+-  // Read arm joint states
+-  const auto& arm_motors = openarm_->get_arm().get_motors();
+-  for (size_t i = 0; i < ARM_DOF && i < arm_motors.size(); ++i) {
+-    pos_states_[i] = arm_motors[i].get_position();
+-    vel_states_[i] = arm_motors[i].get_velocity();
+-    tau_states_[i] = arm_motors[i].get_torque();
+-  }
+-
+-  // Read gripper state if enabled
+-  if (hand_ && joint_names_.size() > ARM_DOF) {
+-    const auto& gripper_motors = openarm_->get_gripper().get_motors();
+-    if (!gripper_motors.empty()) {
+-      // TODO the mappings are approximates
+-      // Convert motor position (radians) to joint value (0-0.044m)
+-      double motor_pos = gripper_motors[0].get_position();
+-      pos_states_[ARM_DOF] = motor_radians_to_joint(motor_pos);
+-
+-      // Unimplemented: Velocity and torque mapping
+-      vel_states_[ARM_DOF] = 0;  // gripper_motors[0].get_velocity();
+-      tau_states_[ARM_DOF] = 0;  // gripper_motors[0].get_torque();
++    if (!collect_runtime_feedback()) {
++      RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
++                   "Enabled runtime feedback is invalid or stale; disabling "
++                   "hardware instead of publishing unsafe state");
++      best_effort_disable();
++      rclcpp::shutdown();
++      return hardware_interface::return_type::ERROR;
++    }
++
++    // Read arm joint states
++    const auto& arm_motors = openarm_->get_arm().get_motors();
++    for (size_t i = 0; i < ARM_DOF && i < arm_motors.size(); ++i) {
++      pos_states_[i] = arm_motors[i].get_position();
++      vel_states_[i] = arm_motors[i].get_velocity();
++      tau_states_[i] = arm_motors[i].get_torque();
++    }
++
++    // Read gripper state if enabled
++    if (hand_ && joint_names_.size() > ARM_DOF) {
++      const auto& gripper_motors = openarm_->get_gripper().get_motors();
++      if (!gripper_motors.empty()) {
++        // TODO the mappings are approximates
++        // Convert motor position (radians) to joint value (0-0.044m)
++        double motor_pos = gripper_motors[0].get_position();
++        pos_states_[ARM_DOF] = motor_radians_to_joint(motor_pos);
++
++        // Unimplemented: Velocity and torque mapping
++        vel_states_[ARM_DOF] = 0;  // gripper_motors[0].get_velocity();
++        tau_states_[ARM_DOF] = 0;  // gripper_motors[0].get_torque();
++      }
+     }
+-  }
+ 
+-  return hardware_interface::return_type::OK;
++    return hardware_interface::return_type::OK;
+   } catch (const std::exception& exception) {
+     RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
+                  "OpenArm runtime read exception: %s", exception.what());

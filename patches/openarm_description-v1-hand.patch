@@ -1,0 +1,49 @@
+diff --git a/assets/robot/openarm_v1.0/urdf/openarm_v10.urdf.xacro b/assets/robot/openarm_v1.0/urdf/openarm_v10.urdf.xacro
+index 28b8208..c7bec24 100644
+--- a/assets/robot/openarm_v1.0/urdf/openarm_v10.urdf.xacro
++++ b/assets/robot/openarm_v1.0/urdf/openarm_v10.urdf.xacro
+@@ -36,5 +36,6 @@ limitations under the License.
+   <xacro:arg name="left_arm_base_xyz" default="0.0 0.031 0.698" />
+   <xacro:arg name="left_arm_base_rpy" default="-1.5708 0 0" />
+   <xacro:arg name="can_fd" default="true" />
++  <xacro:arg name="hand" default="true" />
+   <xacro:property name="accepted_arm_types" value="${('v10', 'v1.0', 'v1_0', 'openarm_v10', 'openarm_v1.0', 'openarm_v1_0')}" />
+   <xacro:if value="${'$(arg arm_type)' not in accepted_arm_types}">
+@@ -85,6 +86,7 @@ limitations under the License.
+   right_arm_base_rpy="$(arg right_arm_base_rpy)"
+   left_arm_base_rpy="$(arg left_arm_base_rpy)"
+   can_fd="$(arg can_fd)"
++  hand="$(arg hand)"
+   />
+ 
+ </robot>
+diff --git a/assets/robot/openarm_v1.0/urdf/robot/openarm_robot.xacro b/assets/robot/openarm_v1.0/urdf/robot/openarm_robot.xacro
+index a6cfd39..898ca0c 100644
+--- a/assets/robot/openarm_v1.0/urdf/robot/openarm_robot.xacro
++++ b/assets/robot/openarm_v1.0/urdf/robot/openarm_robot.xacro
+@@ -52,6 +52,7 @@ limitations under the License.
+             left_arm_prefix:='left_'
+             right_arm_prefix:='right_'
+             can_fd:='true'
++            hand:=true
+             "
+             >
+ 
+@@ -146,7 +147,7 @@ limitations under the License.
+             fake_sensor_commands="${fake_sensor_commands}"
+             left_arm_prefix="${left_arm_prefix}"
+             right_arm_prefix="${right_arm_prefix}"
+-            hand="true"
++            hand="${hand}"
+             ee_type="${ee_type}"/>
+         </xacro:if>
+     </xacro:if>
+@@ -185,7 +186,7 @@ limitations under the License.
+                 can_interface="${can_interface}"
+                 use_fake_hardware="${use_fake_hardware}"
+                 fake_sensor_commands="${fake_sensor_commands}"
+-                hand="true"
++                hand="${hand}"
+                 can_fd="${can_fd}"
+                 ee_type="${ee_type}"/>
+         </xacro:if>

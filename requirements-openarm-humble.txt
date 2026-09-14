@@ -1,0 +1,10 @@
+# OpenArm v1 IK versions inherited from the original deployment.
+# Baseline Python dependencies are in requirements.txt.
+# Dockerfile.openarm-v1 MUST apply and verify openarm_control-constrained-ik.patch;
+# installing these wheels alone does not provide the real-hardware safety contract.
+daqp==0.7.2
+mink==1.1.0
+mujoco==3.6.0
+qpsolvers==4.11.0
+openarm-mujoco==2.0.1
+openarm-control==0.2.0
